@@ -1,13 +1,12 @@
 #
 # build container
 #
-FROM golang:1.13-alpine as builder
+FROM golang:1.16-alpine as builder
 WORKDIR /go/src/github.com/oliver006/redis_exporter/
 
-ADD *.go /go/src/github.com/oliver006/redis_exporter/
-ADD vendor /go/src/github.com/oliver006/redis_exporter/vendor
+ADD . /go/src/github.com/oliver006/redis_exporter/
 
-ARG GOARCH="amd64"
+ARG GOARCH="arm"
 ARG SHA1="[no-sha]"
 ARG TAG="[no-tag]"
 
@@ -25,6 +24,9 @@ FROM arm32v6/alpine:3.6 as alpine-arm
 
 COPY --from=builder /redis_exporter /redis_exporter
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+
+# Run as non-root user for secure environments
+USER 59000:59000
 
 EXPOSE     9121
 ENTRYPOINT [ "/redis_exporter" ]
