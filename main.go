@@ -59,6 +59,7 @@ func main() {
 		redisUser               = flag.String("redis.user", getEnv("REDIS_USER", ""), "User name to use for authentication (Redis ACL for Redis 6.0 and newer)")
 		redisPwd                = flag.String("redis.password", getEnv("REDIS_PASSWORD", ""), "Password of the Redis instance to scrape")
 		redisPwdFile            = flag.String("redis.password-file", getEnv("REDIS_PASSWORD_FILE", ""), "Password file of the Redis instance to scrape")
+		redisFile           		= flag.String("redis.file", getEnv("REDIS_FILE", ""), "Path to file containing one or more redis nodes, separated by newline. NOTE: mutually exclusive with redis.addr")
 		namespace               = flag.String("namespace", getEnv("REDIS_EXPORTER_NAMESPACE", "redis"), "Namespace for metrics")
 		checkKeys               = flag.String("check-keys", getEnv("REDIS_EXPORTER_CHECK_KEYS", ""), "Comma separated list of key-patterns to export value and length/size, searched for with SCAN")
 		checkSingleKeys         = flag.String("check-single-keys", getEnv("REDIS_EXPORTER_CHECK_SINGLE_KEYS", ""), "Comma separated list of single keys to export value and length/size")
@@ -162,45 +163,60 @@ func main() {
 		registry = prometheus.DefaultRegisterer.(*prometheus.Registry)
 	}
 
-	exp, err := exporter.NewRedisExporter(
-		*redisAddr,
-		exporter.Options{
-			User:                    *redisUser,
-			Password:                *redisPwd,
-			PasswordMap:             passwordMap,
-			Namespace:               *namespace,
-			ConfigCommandName:       *configCommand,
-			CheckKeys:               *checkKeys,
-			CheckSingleKeys:         *checkSingleKeys,
-			CheckKeyGroups:          *checkKeyGroups,
-			CheckKeyGroupsBatchSize: *checkKeyGroupsBatchSize,
-			MaxDistinctKeyGroups:    *maxDistinctKeyGroups,
-			CheckStreams:            *checkStreams,
-			CheckSingleStreams:      *checkSingleStreams,
-			CountKeys:               *countKeys,
-			LuaScript:               ls,
-			InclSystemMetrics:       *inclSystemMetrics,
-			SetClientName:           *setClientName,
-			IsTile38:                *isTile38,
-			ExportClientList:        *exportClientList,
-			ExportClientsInclPort:   *exportClientPort,
-			SkipTLSVerification:     *skipTLSVerification,
-			ClientCertificates:      tlsClientCertificates,
-			CaCertificates:          tlsCaCertificates,
-			ConnectionTimeouts:      to,
-			MetricsPath:             *metricPath,
-			RedisMetricsOnly:        *redisMetricsOnly,
-			PingOnConnect:           *pingOnConnect,
-			Registry:                registry,
-			BuildInfo: exporter.BuildInfo{
-				Version:   BuildVersion,
-				CommitSha: BuildCommitSha,
-				Date:      BuildDate,
+	servers := []exporter.ServerInfo{exporter.ServerInfo{Addr: *redisAddr, Password: *redisPwd, Alias: *redisAddr}}
+	if *redisFile != "" {
+	  if servers, err = exporter.LoadRedisFile(*redisFile); err != nil {
+	    log.Fatal(err)
+	  }
+	}
+
+	var exp *exporter.Exporter
+	for _, server := range servers {
+		if len(servers) > 1 {
+		  server.AddConstLabels = true
+		}
+		exp, err = exporter.NewRedisExporter(
+			server,
+			exporter.Options{
+				User:                    *redisUser,
+				Password:                *redisPwd,
+				PasswordMap:             passwordMap,
+				Namespace:               *namespace,
+				ConfigCommandName:       *configCommand,
+				CheckKeys:               *checkKeys,
+				CheckSingleKeys:         *checkSingleKeys,
+				CheckKeyGroups:          *checkKeyGroups,
+				CheckKeyGroupsBatchSize: *checkKeyGroupsBatchSize,
+				MaxDistinctKeyGroups:    *maxDistinctKeyGroups,
+				CheckStreams:            *checkStreams,
+				CheckSingleStreams:      *checkSingleStreams,
+				CountKeys:               *countKeys,
+				LuaScript:               ls,
+				InclSystemMetrics:       *inclSystemMetrics,
+				SetClientName:           *setClientName,
+				IsTile38:                *isTile38,
+				ExportClientList:        *exportClientList,
+				ExportClientsInclPort:   *exportClientPort,
+				SkipTLSVerification:     *skipTLSVerification,
+				ClientCertificates:      tlsClientCertificates,
+				CaCertificates:          tlsCaCertificates,
+				ConnectionTimeouts:      to,
+				MetricsPath:             *metricPath,
+				RedisMetricsOnly:        *redisMetricsOnly,
+				PingOnConnect:           *pingOnConnect,
+				Registry:                registry,
+				BuildInfo: exporter.BuildInfo{
+					Version:   BuildVersion,
+					CommitSha: BuildCommitSha,
+					Date:      BuildDate,
+				},
 			},
-		},
-	)
-	if err != nil {
-		log.Fatal(err)
+		)
+		if err != nil {
+			log.Fatal(err)
+		} else {
+			log.Infof("Configured with redis addr: %s [%s]", server.Addr, server.Alias)
+		}
 	}
 
 	log.Infof("Providing metrics at %s%s", *listenAddress, *metricPath)

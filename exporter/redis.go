@@ -29,7 +29,7 @@ func (e *Exporter) connectToRedis() (redis.Conn, error) {
 		options = append(options, redis.DialPassword(e.options.Password))
 	}
 
-	uri := e.redisAddr
+	uri := e.server.Addr
 	if !strings.Contains(uri, "://") {
 		uri = "redis://" + uri
 	}
@@ -42,12 +42,12 @@ func (e *Exporter) connectToRedis() (redis.Conn, error) {
 	c, err := redis.DialURL(uri, options...)
 	if err != nil {
 		log.Debugf("DialURL() failed, err: %s", err)
-		if frags := strings.Split(e.redisAddr, "://"); len(frags) == 2 {
+		if frags := strings.Split(e.server.Addr, "://"); len(frags) == 2 {
 			log.Debugf("Trying: Dial(): %s %s", frags[0], frags[1])
 			c, err = redis.Dial(frags[0], frags[1], options...)
 		} else {
-			log.Debugf("Trying: Dial(): tcp %s", e.redisAddr)
-			c, err = redis.Dial("tcp", e.redisAddr, options...)
+			log.Debugf("Trying: Dial(): tcp %s", e.server.Addr)
+			c, err = redis.Dial("tcp", e.server.Addr, options...)
 		}
 	}
 	return c, err

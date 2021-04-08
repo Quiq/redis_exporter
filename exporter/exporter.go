@@ -3,8 +3,10 @@ package exporter
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/csv"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,12 +25,19 @@ type BuildInfo struct {
 	Date      string
 }
 
+type ServerInfo struct {
+	Addr           string
+	Password       string
+	Alias          string
+	AddConstLabels bool
+}
+
 // Exporter implements the prometheus.Exporter interface, and exports Redis metrics.
 type Exporter struct {
 	sync.Mutex
-
-	redisAddr string
-	namespace string
+	server      ServerInfo
+	constLabels prometheus.Labels
+	namespace 	string
 
 	totalScrapes              prometheus.Counter
 	scrapeDuration            prometheus.Summary
@@ -78,11 +87,28 @@ type Options struct {
 }
 
 // NewRedisExporter returns a new exporter of Redis metrics.
-func NewRedisExporter(redisURI string, opts Options) (*Exporter, error) {
+func NewRedisExporter(serverArg interface{}, opts Options) (*Exporter, error) {
 	log.Debugf("NewRedisExporter options: %#v", opts)
 
+	var server ServerInfo
+	switch v := serverArg.(type) {
+	case ServerInfo:
+		server = v
+	case string:
+		server.Addr = v
+	}
+
+	constLabels := prometheus.Labels{}
+	if server.AddConstLabels {
+		if server.Alias == "" {
+			server.Alias = server.Addr
+		}
+		constLabels = prometheus.Labels{"addr": server.Addr, "alias": server.Alias}
+	}
+
 	e := &Exporter{
-		redisAddr: redisURI,
+		server:      server,
+		constLabels: constLabels,
 		options:   opts,
 		namespace: opts.Namespace,
 
@@ -92,18 +118,21 @@ func NewRedisExporter(redisURI string, opts Options) (*Exporter, error) {
 			Namespace: opts.Namespace,
 			Name:      "exporter_scrapes_total",
 			Help:      "Current total redis scrapes.",
+			ConstLabels: constLabels,
 		}),
 
 		scrapeDuration: prometheus.NewSummary(prometheus.SummaryOpts{
 			Namespace: opts.Namespace,
 			Name:      "exporter_scrape_duration_seconds",
 			Help:      "Durations of scrapes by the exporter",
+			ConstLabels: constLabels,
 		}),
 
 		targetScrapeRequestErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: opts.Namespace,
 			Name:      "target_scrape_request_errors_total",
 			Help:      "Errors in requests to the exporter",
+			ConstLabels: constLabels,
 		}),
 
 		metricMapGauges: map[string]string{
@@ -366,7 +395,7 @@ func NewRedisExporter(redisURI string, opts Options) (*Exporter, error) {
 		"up":                                           {txt: "Information about the Redis instance"},
 		"connected_clients_details":                    {txt: "Details about connected clients", lbls: connectedClientsLabels},
 	} {
-		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
+		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls, constLabels)
 	}
 
 	if e.options.MetricsPath == "" {
@@ -386,6 +415,7 @@ func NewRedisExporter(redisURI string, opts Options) (*Exporter, error) {
 				Namespace: opts.Namespace,
 				Name:      "exporter_build_info",
 				Help:      "redis exporter build_info",
+				ConstLabels: constLabels,
 			}, []string{"version", "commit_sha", "build_date", "golang_version"})
 			buildInfoCollector.WithLabelValues(e.buildInfo.Version, e.buildInfo.CommitSha, e.buildInfo.Date, runtime.Version()).Set(1)
 			e.options.Registry.MustRegister(buildInfoCollector)
@@ -406,11 +436,11 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	}
 
 	for _, v := range e.metricMapGauges {
-		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil, e.constLabels)
 	}
 
 	for _, v := range e.metricMapCounters {
-		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil, e.constLabels)
 	}
 
 	ch <- e.totalScrapes.Desc()
@@ -424,7 +454,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	defer e.Unlock()
 	e.totalScrapes.Inc()
 
-	if e.redisAddr != "" {
+	if e.server.Addr != "" {
 		startTime := time.Now()
 		var up float64
 		if err := e.scrapeRedisHost(ch); err != nil {
@@ -486,12 +516,12 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 
 	if err != nil {
 		log.Errorf("Couldn't connect to redis instance")
-		log.Debugf("connectToRedis( %s ) err: %s", e.redisAddr, err)
+		log.Debugf("connectToRedis( %s ) err: %s", e.server.Addr, err)
 		return err
 	}
 	defer c.Close()
 
-	log.Debugf("connected to: %s", e.redisAddr)
+	log.Debugf("connected to: %s", e.server.Addr)
 	log.Debugf("connecting took %f seconds", connectTookSeconds)
 
 	if e.options.PingOnConnect {
@@ -586,4 +616,35 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 	}
 
 	return nil
+}
+
+// LoadRedisFile opens the specified file and loads the configuration for which redis
+// hosts to monitor. Returns the list of hosts addrs, passwords, and their aliases.
+func LoadRedisFile(fileName string) ([]ServerInfo, error) {
+	var servers []ServerInfo
+	file, err := os.Open(fileName)
+	if err != nil {
+		return nil, err
+	}
+	r := csv.NewReader(file)
+	r.FieldsPerRecord = -1
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	file.Close()
+	// For each line, test if it contains an optional password and alias and provide them,
+	// else give them empty strings
+	for _, record := range records {
+		length := len(record)
+		switch length {
+		case 3:
+			servers = append(servers, ServerInfo{Addr: record[0], Password: record[1], Alias: record[2]})
+		case 2:
+			servers = append(servers, ServerInfo{Addr: record[0], Password: record[1]})
+		case 1:
+			servers = append(servers, ServerInfo{Addr: record[0]})
+		}
+	}
+	return servers, nil
 }
