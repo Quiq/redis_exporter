@@ -9,63 +9,172 @@ workspace:
 services:
   - name: redis5
     image: redis:5
+    commands:
+      - "redis-server --port 6383  --dbfilename dump5.rdb"
+    ports:
+      - 6383
+
+  - name: redis6
+    image: redis:6
+    commands:
+      - "redis-server --protected-mode no --dbfilename dump6.rdb"
     ports:
       - 6379
+
   - name: pwd-redis5
     image: redis:5
     commands:
-      - "/usr/local/bin/redis-server --port 6380 --requirepass redis-password"
+      - "redis-server --port 6380 --requirepass redis-password --dbfilename dump5-pwd.rdb"
     ports:
       - 6380
+
+  - name: pwd-redis6
+    image: redis:6
+    commands:
+      - "redis-server --port 6390 --requirepass dummy --user exporter on +INFO +CLIENT +SELECT +SLOWLOG +LATENCY '>exporter-password' --dbfilename dump6-pwd.rdb"
+    ports:
+      - 6390
+
   - name: redis-2-8
     image: redis:2.8
     commands:
-      - "/usr/local/bin/redis-server --port 6381"
+      - "redis-server --port 6381 --dbfilename dump2-8.rdb"
     ports:
       - 6381
+
+  - name: keydb-01
+    image: "eqalpha/keydb:x86_64_v5.3.0"
+    commands:
+      - "keydb-server --protected-mode no --port 6401 --dbfilename dump-keydb-01.rdb"
+    ports:
+      - 6401
+
+  - name: keydb-02
+    image: "eqalpha/keydb:x86_64_v5.3.0"
+    commands:
+      - "keydb-server --protected-mode no --port 6402 --active-replica yes --replicaof keydb-01 6401  --dbfilename dump-keydb-02.rdb"
+    ports:
+      - 6402
+
   - name: redis-cluster
     image: grokzen/redis-cluster
-    ports:
-      - 7000
-      - 7001
-      - 7002
-      - 7003
-      - 7004
-      - 7005
+    ports: [7000, 7001, 7002, 7003, 7004, 7005]
+
   - name: tile38
     image: tile38/tile38:latest
     ports:
       - 9851
 
+  - name: redis-sentinel
+    image: docker.io/bitnami/redis-sentinel:6.0-debian-10
+    environment:
+      REDIS_MASTER_HOST: redis6
+    ports:
+      - 26379
+
 
 steps:
-  - name: tests
-    image: "golang:1.13"
-    environment:
-      GO111MODULE: on
-      LOG_LEVEL: "info"
-      TEST_TILE38_URI: "redis://tile38:9851"
-      TEST_REDIS_URI: "redis://redis5:6379"
-      TEST_REDIS_2_8_URI: "redis://redis-2-8:6381"
-      TEST_PWD_REDIS_URI: "redis://h:redis-password@pwd-redis5:6380"
-      TEST_REDIS_CLUSTER_MASTER_URI: "redis://redis-cluster:7000"
-      TEST_REDIS_CLUSTER_SLAVE_URI: "redis://redis-cluster:7005"
-      COVERALLS_TOKEN:
-        from_secret: coveralls-token
+  - name: start
+    image: "golang:1.16"
     commands:
-      - 'go build -mod=vendor'
-      - "sleep 10"   # let the redis test instances all come up first
-      - 'go test -mod=vendor -v -covermode=atomic -cover -race -coverprofile=coverage.txt .'
-      - 'echo "checking gofmt"'
-      - 'echo " ! gofmt -d *.go       2>&1 | read " | bash'
-      - 'echo "checking gofmt - DONE"'
-      - 'go vet -mod=vendor .'
-      - 'go get github.com/mattn/goveralls'
-      - '/go/bin/goveralls -coverprofile=coverage.txt -service=drone.io'
+      - sleep 5
+      - 'echo "start"'
     when:
       event:
         - pull_request
         - push
+        - tag
+
+
+  - name: build-binaries
+    image: "golang:1.16"
+    pull: always
+    environment:
+      GO111MODULE: on
+      LOG_LEVEL: "info"
+    commands:
+      - make build-binaries
+    when:
+      event:
+        - pull_request
+        - push
+        - tag
+    depends_on:
+      - start
+
+  - name: test-docker-build
+    image: plugins/docker
+    settings:
+      tags: "test"
+      dockerfile: ./docker/Dockerfile.amd64
+      repo: oliver006/redis_exporter
+      target: scratch
+      dry_run: true
+      build_args:
+        - 'TAG=test'
+        - 'SHA1=${DRONE_COMMIT_SHA}'
+        - 'GOARCH=amd64'
+      username:
+        from_secret: docker_test_user
+      password:
+        from_secret: docker_test_pass
+    when:
+      event:
+        - pull_request
+        - push
+        - tag
+    depends_on:
+      - start
+
+  - name: lint
+    image: golangci/golangci-lint:latest-alpine
+    pull: always
+    commands:
+      - apk add --update make
+      - make lint
+    when:
+      event:
+        - pull_request
+        - push
+        - tag
+    depends_on:
+      - start
+
+  - name: tests
+    image: "golang:1.16"
+    pull: always
+    environment:
+      GO111MODULE: on
+      LOG_LEVEL: "info"
+      COVERALLS_TOKEN:
+        from_secret: coveralls-token
+    commands:
+      - sleep 5
+      - make checks
+      - make test
+      - make upload-coverage
+    when:
+      event:
+        - pull_request
+        - push
+    depends_on:
+      - start
+
+
+  - name: mixins
+    image: golang:1.16
+    commands:
+      - cd ./contrib/redis-mixin
+      - go install github.com/monitoring-mixins/mixtool/cmd/mixtool
+      - go install github.com/google/go-jsonnet/cmd/jsonnetfmt
+      - cd ../../
+      - make mixin
+    when:
+      event:
+        - pull_request
+        - push
+    depends_on:
+      - start
 
 
   - name: coverage-codecov
@@ -79,6 +188,8 @@ steps:
       event:
         - pull_request
         - push
+    depends_on:
+      - tests
 
 
   - name: release-docker-image-scratch
@@ -99,6 +210,8 @@ steps:
     when:
       event:
         - tag
+    depends_on:
+      - tests
 
 
   - name: release-docker-image-alpine-arm64
@@ -119,6 +232,8 @@ steps:
     when:
       event:
         - tag
+    depends_on:
+      - tests
 
 
   - name: release-docker-image-alpine-arm
@@ -139,6 +254,8 @@ steps:
     when:
       event:
         - tag
+    depends_on:
+      - tests
 
 
   - name: release-docker-image-alpine-amd64
@@ -159,17 +276,23 @@ steps:
     when:
       event:
         - tag
+    depends_on:
+      - tests
 
 
   - name: release-github-binaries
-    image: "golang:1.13"
+    image: "golang:1.16"
+    pull: always
     environment:
       GITHUB_TOKEN:
         from_secret: github_token
       GO111MODULE: on
     commands:
       - "apt-get update && apt-get install -y zip"
-      - "./build-github-binaries.sh"
+      - "./release-github-binaries.sh"
     when:
       event:
         - tag
+    depends_on:
+      - tests
+      - build-binaries
