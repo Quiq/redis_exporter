@@ -25,16 +25,16 @@ func (e *Exporter) connectToRedis() (redis.Conn, error) {
 		options = append(options, redis.DialUsername(e.options.User))
 	}
 
-	if e.options.Password != "" {
-		options = append(options, redis.DialPassword(e.options.Password))
-	}
-
 	uri := e.server.Addr
 	if !strings.Contains(uri, "://") {
 		uri = "redis://" + uri
 	}
 
-	if e.options.PasswordMap[uri] != "" {
+	if e.options.Password != "" {
+		options = append(options, redis.DialPassword(e.options.Password))
+	} else if e.server.Password != "" {
+		options = append(options, redis.DialPassword(e.server.Password))
+	} else if e.options.PasswordMap[uri] != "" {
 		options = append(options, redis.DialPassword(e.options.PasswordMap[uri]))
 	}
 
