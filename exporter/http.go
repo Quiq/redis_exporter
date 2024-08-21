@@ -107,3 +107,36 @@ func (e *Exporter) reloadPwdFile(w http.ResponseWriter, r *http.Request) {
 	e.Unlock()
 	_, _ = w.Write([]byte(`ok`))
 }
+
+func (e *Exporter) scrapeAllHandler(w http.ResponseWriter, r *http.Request) {
+	registry := prometheus.NewRegistry()
+	e.options.Registry = registry
+	e.options.ScrapeMultipleUris = true
+	for target := range e.options.PasswordMap {
+		if !strings.Contains(target, "://") {
+			target = "redis://" + target
+		}
+
+		u, err := url.Parse(target)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid URI, parse err: %ck ", err), http.StatusBadRequest)
+			e.targetScrapeRequestErrors.Inc()
+			return
+		}
+
+		// get rid of username/password if present in the uri itself
+		u.User = nil
+		target = u.String()
+
+		_, err = NewRedisExporter(target, e.options)
+		if err != nil {
+			http.Error(w, "NewRedisExporter() err: err", http.StatusBadRequest)
+			e.targetScrapeRequestErrors.Inc()
+			return
+		}
+	}
+
+	promhttp.HandlerFor(
+		registry, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError},
+	).ServeHTTP(w, r)
+}

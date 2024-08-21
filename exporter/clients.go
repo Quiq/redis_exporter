@@ -122,7 +122,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				connectedClientsLabelsValues = append(connectedClientsLabelsValues, resp)
 			}
 
-			e.metricDescriptions["connected_clients_details"] = newMetricDescr(e.options.Namespace, "connected_clients_details", "Details about connected clients", connectedClientsLabels)
+			e.metricDescriptions["connected_clients_details"] = newMetricDescr(e.options.Namespace, "connected_clients_details", "Details about connected clients", connectedClientsLabels, e.constLabels)
 
 			e.registerConstMetricGauge(
 				ch, "connected_clients_details", 1.0,
