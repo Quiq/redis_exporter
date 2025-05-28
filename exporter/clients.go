@@ -156,6 +156,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_info",
 				"Details about a connected client",
 				clientInfoLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_info", 1.0,
@@ -170,6 +171,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_output_buffer_memory_usage_bytes",
 				"A connected client's output buffer memory usage in bytes",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_output_buffer_memory_usage_bytes", float64(info.OMem),
@@ -181,6 +183,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_total_memory_consumed_bytes",
 				"Total memory consumed by a client in its various buffers",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_total_memory_consumed_bytes", float64(info.TotMem),
@@ -192,6 +195,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_created_at_timestamp",
 				"A connected client's creation timestamp",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_created_at_timestamp", float64(info.CreatedAt),
@@ -203,6 +207,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_idle_since_timestamp",
 				"A connected client's idle since timestamp",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_idle_since_timestamp", float64(info.IdleSince),
@@ -214,6 +219,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_channel_subscriptions_count",
 				"A connected client's number of channel subscriptions",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_channel_subscriptions_count", float64(info.Sub),
@@ -225,6 +231,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_pattern_matching_subscriptions_count",
 				"A connected client's number of pattern matching subscriptions",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_pattern_matching_subscriptions_count", float64(info.Psub),
@@ -237,6 +244,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 					"connected_client_shard_channel_subscriptions_count",
 					"a connected client's number of shard channel subscriptions",
 					clientBaseLabels,
+					e.constLabels,
 				)
 				e.registerConstMetricGauge(
 					ch, "connected_client_shard_channel_subscriptions_count", float64(info.Ssub),
@@ -249,6 +257,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 					"connected_client_shard_channel_watched_keys",
 					"a connected client's number of keys it's currently watching",
 					clientBaseLabels,
+					e.constLabels,
 				)
 				e.registerConstMetricGauge(
 					ch, "connected_client_shard_channel_watched_keys", float64(info.Watch),
@@ -261,6 +270,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_query_buffer_length_bytes",
 				"A connected client's query buffer length in bytes (0 means no query pending)",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_query_buffer_length_bytes", float64(info.Qbuf),
@@ -272,6 +282,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_query_buffer_free_space_bytes",
 				"A connected client's free space of the query buffer in bytes (0 means the buffer is full)",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_query_buffer_free_space_bytes", float64(info.QbufFree),
@@ -283,6 +294,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_output_buffer_length_bytes",
 				"A connected client's output buffer length in bytes",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_output_buffer_length_bytes", float64(info.Obl),
@@ -294,6 +306,7 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 				"connected_client_output_list_length",
 				"A connected client's output list length (replies are queued in this list when the buffer is full)",
 				clientBaseLabels,
+				e.constLabels,
 			)
 			e.registerConstMetricGauge(
 				ch, "connected_client_output_list_length", float64(info.Oll),
