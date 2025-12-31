@@ -16,8 +16,8 @@ func sanitizeMetricName(n string) string {
 	return metricNameRE.ReplaceAllString(n, "_")
 }
 
-func newMetricDescr(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
-	return prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), docString, labels, nil)
+func newMetricDescr(namespace string, metricName string, docString string, labels []string, constLabels prometheus.Labels) *prometheus.Desc {
+	return prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), docString, labels, constLabels)
 }
 
 func (e *Exporter) includeMetric(s string) bool {
@@ -131,7 +131,7 @@ func (e *Exporter) createMetricDescription(metricName string, labels []string) *
 	if desc, found := e.metricDescriptions[metricName]; found {
 		return desc
 	}
-	d := newMetricDescr(e.options.Namespace, metricName, metricName+" metric", labels)
+	d := newMetricDescr(e.options.Namespace, metricName, metricName+" metric", labels, e.constLabels)
 	e.metricDescriptions[metricName] = d
 	return d
 }
