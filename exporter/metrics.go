@@ -16,8 +16,8 @@ func sanitizeMetricName(n string) string {
 	return metricNameRE.ReplaceAllString(n, "_")
 }
 
-func newMetricDescr(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
-	return prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), docString, labels, nil)
+func newMetricDescr(namespace string, metricName string, docString string, labels []string, constLabels prometheus.Labels) *prometheus.Desc {
+	return prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), docString, labels, constLabels)
 }
 
 func (e *Exporter) includeMetric(s string) bool {
@@ -143,7 +143,7 @@ func (e *Exporter) createMetricDescription(metricName string, labels []string) *
 	if e.options.AppendInstanceRoleLabel && metricName != "exporter_last_scrape_connect_time_seconds" && metricName != "exporter_last_scrape_ping_time_seconds" {
 		labels = append(labels, "instance_role") // append instance_role label to all metrics (except 2 collected before instanceRole)
 	}
-	d := newMetricDescr(e.options.Namespace, metricName, metricName+" metric", labels)
+	d := newMetricDescr(e.options.Namespace, metricName, metricName+" metric", labels, e.constLabels)
 	e.metricDescriptions[metricName] = d
 	return d
 }
