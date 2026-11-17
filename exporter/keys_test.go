@@ -12,6 +12,7 @@ import (
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -78,9 +79,9 @@ func TestKeyValuesAsLabel(t *testing.T) {
 }
 
 func TestClusterKeyValuesAndSizes(t *testing.T) {
-	clusterUri := os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI")
+	clusterUri := os.Getenv("TEST_VALKEY_CLUSTER_MASTER_URI")
 	if clusterUri == "" {
-		t.Skipf("Skipping TestClusterKeyValuesAndSizes, don't have env var TEST_REDIS_CLUSTER_MASTER_URI")
+		t.Skipf("Skipping TestClusterKeyValuesAndSizes, don't have env var TEST_VALKEY_CLUSTER_MASTER_URI")
 	}
 	setupTestKeysCluster(t, clusterUri)
 	defer deleteTestKeysCluster(t, clusterUri)
@@ -90,10 +91,10 @@ func TestClusterKeyValuesAndSizes(t *testing.T) {
 			clusterUri,
 			Options{
 				Namespace: "test", DisableExportingKeyValues: disableExportingValues,
+				// The single-database cluster fixture stores these keys in DB 0.
 				CheckSingleKeys: fmt.Sprintf(
-					"%s=%s,%s=%s",
-					dbNumStrFull, url.QueryEscape(testKeys[0]),
-					dbNumStrFull, url.QueryEscape(TestKeyNameSet),
+					"db0=%s,db0=%s",
+					url.QueryEscape(testKeys[0]), url.QueryEscape(TestKeyNameSet),
 				),
 				IsCluster: true,
 			},
@@ -333,7 +334,7 @@ func TestScanKeys(t *testing.T) {
 
 	createKeyFixtures(t, c, fixtures)
 
-	matches, err := redis.Strings(scanKeys(c, "get_keys_test_*shouldmatch*", defaultCount))
+	matches, err := redis.Strings(scanKeys(c, "get_keys_test_*shouldmatch*", defaultCount, ""))
 	if err != nil {
 		t.Errorf("Error getting keys matching a pattern: %#v", err)
 	}
@@ -356,7 +357,7 @@ func TestScanKeys(t *testing.T) {
 		"pattern": invalidCount,
 	}
 	for pattern, count := range invalidFixtures {
-		got, err := redis.Strings(scanKeys(c, pattern, count))
+		got, err := redis.Strings(scanKeys(c, pattern, count, ""))
 		if err != nil {
 			t.Logf("\"Passed\" expected, got error: %#v", err)
 			if pattern == "" && err.Error() != "pattern shouldn't be empty" {
@@ -367,6 +368,64 @@ func TestScanKeys(t *testing.T) {
 				t.Errorf("Error expected, got valid response: %#v", got)
 			}
 		}
+	}
+}
+
+func TestScanKeysWithType(t *testing.T) {
+	fixtures := []keyFixture{
+		newKeyFixture("SET", "scan_type_test_string_1", "Woohoo!"),
+		newKeyFixture("SET", "scan_type_test_string_2", "Woohoo!"),
+		newKeyFixture("HSET", "scan_type_test_hash", "field_1", "str_1"),
+		newKeyFixture("XADD", "scan_type_test_stream_1", "*", "field_1", "str_1"),
+		newKeyFixture("XADD", "scan_type_test_stream_2", "*", "field_1", "str_1"),
+	}
+	allKeys := []string{
+		"scan_type_test_hash",
+		"scan_type_test_stream_1",
+		"scan_type_test_stream_2",
+		"scan_type_test_string_1",
+		"scan_type_test_string_2",
+	}
+	streamKeys := []string{
+		"scan_type_test_stream_1",
+		"scan_type_test_stream_2",
+	}
+
+	for _, tst := range []struct {
+		name string
+		addr string
+		want []string
+	}{
+		{"redis", os.Getenv("TEST_REDIS_URI"), streamKeys},
+		// redis 5 has no TYPE option for SCAN, the scan falls back to all key types
+		{"redis5", os.Getenv("TEST_REDIS5_URI"), allKeys},
+	} {
+		t.Run(tst.name, func(t *testing.T) {
+			if tst.addr == "" {
+				t.Skipf("missing env var, skipping")
+			}
+			c, err := redis.DialURL(tst.addr)
+			if err != nil {
+				t.Fatalf("Couldn't connect to %#v: %#v", tst.addr, err)
+			}
+			if _, err = c.Do("SELECT", dbNumStr); err != nil {
+				t.Errorf("Couldn't select database %#v", dbNumStr)
+			}
+			defer func() {
+				deleteKeyFixtures(t, c, fixtures)
+				c.Close()
+			}()
+			createKeyFixtures(t, c, fixtures)
+
+			got, err := redis.Strings(scanKeys(c, "scan_type_test_*", defaultCount, "stream"))
+			if err != nil {
+				t.Fatalf("Error getting stream keys matching a pattern: %#v", err)
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(tst.want, got) {
+				t.Errorf("When scanning for streams:\nexpected: %#v\nactual:   %#v", tst.want, got)
+			}
+		})
 	}
 }
 
@@ -430,7 +489,7 @@ func TestGetKeysFromPatterns(t *testing.T) {
 	}
 	createKeyFixtures(t, c, dbAltFixtures)
 
-	expandedKeys, err := getKeysFromPatterns(c, keys, defaultCount)
+	expandedKeys, err := getKeysFromPatterns(c, keys, defaultCount, "")
 	if err != nil {
 		t.Errorf("Error getting keys from patterns: %#v", err)
 	}
@@ -456,7 +515,7 @@ func TestGetKeysFromPatterns(t *testing.T) {
 		t.Errorf("When expanding keys:\nexpected: %#v\nactual:   %#v", expectedKeys, expandedKeys)
 	}
 
-	got, err := getKeysFromPatterns(c, invalidKeys, defaultCount)
+	got, err := getKeysFromPatterns(c, invalidKeys, defaultCount, "")
 	if err != nil {
 		t.Logf("Expected error - \"invalid DB\": %#v", err)
 	} else {
@@ -616,9 +675,9 @@ func TestCheckKeysMultipleDBs(t *testing.T) {
 }
 
 func TestClusterGetKeyInfo(t *testing.T) {
-	clusterUri := os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI")
+	clusterUri := os.Getenv("TEST_VALKEY_CLUSTER_MASTER_URI")
 	if clusterUri == "" {
-		t.Skipf("Skipping TestClusterKeyValuesAndSizes, don't have env var TEST_REDIS_CLUSTER_MASTER_URI")
+		t.Skipf("Skipping TestClusterKeyValuesAndSizes, don't have env var TEST_VALKEY_CLUSTER_MASTER_URI")
 	}
 
 	e, _ := NewRedisExporter(
@@ -835,5 +894,75 @@ func TestRedis88ArrayGetKeyInfo(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("Expected metric: %s but got:\n%s", want, body)
 		}
+	}
+}
+
+// pipelinedRedisConn answers Receive() from a queue, one reply per sent command.
+type pipelinedRedisConn struct {
+	queuedRedisConn
+	sent [][]any
+}
+
+func (c *pipelinedRedisConn) Send(commandName string, args ...any) error {
+	c.sent = append(c.sent, append([]any{commandName}, args...))
+	return nil
+}
+
+func (c *pipelinedRedisConn) Receive() (any, error) {
+	if len(c.replies) == 0 {
+		return nil, fmt.Errorf("no reply queued")
+	}
+	reply := c.replies[0]
+	c.replies = c.replies[1:]
+	return reply.value, reply.err
+}
+
+func TestCheckKeysPipelinedTypeError(t *testing.T) {
+	/*
+		A TYPE error (e.g. NOPERM for a key outside the ACL user's key patterns)
+		must not shift the replies of the keys that follow it.
+	*/
+	e, _ := NewRedisExporter("redis://localhost:6379", Options{Namespace: "test"})
+
+	noPerm := redis.Error("NOPERM No permissions to access a key")
+	conn := &pipelinedRedisConn{queuedRedisConn: queuedRedisConn{replies: []redisReply{
+		{value: "OK"},       // SELECT 0
+		{err: noPerm},       // TYPE denied
+		{err: noPerm},       // MEMORY USAGE denied
+		{value: "list"},     // TYPE jobs
+		{value: int64(128)}, // MEMORY USAGE jobs
+		{value: int64(5)},   // LLEN jobs
+	}}}
+
+	ch := make(chan prometheus.Metric, 10)
+	e.extractCheckKeyMetricsPipelined(ch, conn, []dbKeyPair{{db: "0", key: "denied"}, {db: "0", key: "jobs"}})
+	close(ch)
+
+	got := map[string]float64{}
+	for m := range ch {
+		d := &dto.Metric{}
+		if err := m.Write(d); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		sub := fqNameRE.FindStringSubmatch(m.Desc().String())
+		if sub == nil {
+			t.Fatalf("cannot read the metric name from %s", m.Desc())
+		}
+		labels := map[string]string{}
+		for _, l := range d.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		got[sub[1]+"{"+labels["key"]+"}"] = d.GetGauge().GetValue()
+	}
+
+	want := map[string]float64{
+		"key_memory_usage_bytes{jobs}": 128,
+		"key_size{jobs}":               5,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("metrics = %v, want %v", got, want)
+	}
+	if len(conn.replies) != 0 {
+		t.Errorf("%d replies left unread", len(conn.replies))
 	}
 }

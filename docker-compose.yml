@@ -7,6 +7,14 @@ services:
       - "16382:6379"
       - "6379:6379"
 
+  valkey9-replica:
+    image: valkey/valkey:9
+    depends_on:
+      - valkey9
+    command: "valkey-server --protected-mode no --replicaof valkey9 6379"
+    ports:
+      - "16381:6379"
+
   valkey9-tls:
     image: valkey/valkey:9
     volumes:
@@ -17,20 +25,15 @@ services:
       --tls-cert-file     /tls/redis.crt
       --tls-key-file      /tls/redis.key
       --tls-ca-cert-file  /tls/ca.crt
+      --user exporter on '>exporter-password' '~*' '&*' '+@all'
     ports:
       - "16386:6379"
 
-  valkey8-bundle:
-    image: valkey/valkey-bundle:8
+  valkey9-bundle:
+    image: valkey/valkey-bundle:9
     command: "valkey-server --enable-debug-command yes --protected-mode no"
     ports:
       - "16389:6379"
-
-  valkey8:
-    image: valkey/valkey:8
-    command: "valkey-server --enable-debug-command yes --protected-mode no"
-    ports:
-      - "16384:6379"
 
   redis8:
     image: redis:8.6.3
@@ -45,6 +48,15 @@ services:
     command: "redis-server  --enable-debug-command yes --protected-mode no"
     ports:
       - "16488:6379"
+
+  # Redis 8 with several IO threads, so the per-thread metrics of the
+  # "# Threads" section have more than one thread to report.
+  redis8-io-threads:
+    image: redis:8.6.3
+    pull_policy: always
+    command: "redis-server --enable-debug-command yes --protected-mode no --io-threads 4"
+    ports:
+      - "16392:6379"
 
   pwd-redis8:
     image: redis:8.6.3
@@ -78,6 +90,18 @@ services:
     ports:
       - "16390:6379"
 
+  redis-connection-tests:
+    image: redis:7.4
+    command: >-
+      redis-server --protected-mode no --save "" --databases 1
+      --unixsocket /data/redis.sock --unixsocketperm 777
+      --user exporter on '>exporter-password' '~*' '&*' '+@all'
+    volumes:
+      # The Linux CI runner connects to this socket directly.
+      - /tmp/redis-exporter-connection-tests:/data
+    ports:
+      - "16391:6379"
+
   redis6:
     image: redis:6.2
     command: "redis-server --protected-mode no"
@@ -102,8 +126,8 @@ services:
     ports:
       - "16402:6379"
 
-  valkey-cluster:
-    image: oliver006/valkey-cluster:8.1.3
+  valkey9-cluster:
+    image: oliver006/valkey-cluster:9.1.1-r1
     environment:
       - IP=0.0.0.0
     ports:
@@ -120,8 +144,17 @@ services:
     ports:
       - 47000-47005:47000-47005
 
-  valkey-cluster-password:
-    image: oliver006/valkey-cluster:8.1.3
+  valkey9-cluster-databases:
+    image: oliver006/valkey-cluster:9.1.1-r1
+    environment:
+      - IP=127.0.0.1
+      - INITIAL_PORT=27000
+      - CLUSTER_DATABASES=4
+    ports:
+      - 27000-27005:27000-27005
+
+  valkey9-cluster-password:
+    image: oliver006/valkey-cluster:9.1.1-r1
     environment:
       - IP=0.0.0.0
       - INITIAL_PORT=7006
@@ -133,12 +166,12 @@ services:
   valkey-sentinel:
     image: valkey/valkey:9
     depends_on:
-      - valkey8
+      - valkey9
     ports:
       - "26379:26379"
     command: >
       sh -c 'echo "sentinel resolve-hostnames yes" > /etc/sentinel.conf &&
-            echo "sentinel monitor mymaster valkey8 6379 1" >> /etc/sentinel.conf &&
+            echo "sentinel monitor mymaster valkey9 6379 1" >> /etc/sentinel.conf &&
             echo "sentinel down-after-milliseconds mymaster 1000" >> /etc/sentinel.conf &&
             echo "sentinel failover-timeout mymaster 5000" >> /etc/sentinel.conf &&
             echo "sentinel parallel-syncs mymaster 1" >> /etc/sentinel.conf &&

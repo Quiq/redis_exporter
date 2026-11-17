@@ -11,7 +11,7 @@ import (
 func TestHostVariations(t *testing.T) {
 	host := strings.ReplaceAll(os.Getenv("TEST_REDIS_URI"), "redis://", "")
 
-	for _, prefix := range []string{"", "redis://", "tcp://", ""} {
+	for _, prefix := range []string{"", "redis://", "tcp://", "REDIS://"} {
 		e, _ := NewRedisExporter(prefix+host, Options{SkipTLSVerification: true})
 		c, err := e.connectToRedis()
 		if err != nil {
@@ -28,7 +28,7 @@ func TestHostVariations(t *testing.T) {
 }
 
 func TestValkeyScheme(t *testing.T) {
-	host := os.Getenv("TEST_VALKEY8_URI")
+	host := os.Getenv("TEST_VALKEY9_URI")
 
 	e, _ := NewRedisExporter(host, Options{SkipTLSVerification: true})
 	c, err := e.connectToRedis()
@@ -109,7 +109,7 @@ func TestPasswordInvalid(t *testing.T) {
 	ts := httptest.NewServer(e)
 	defer ts.Close()
 
-	want := `test_exporter_last_scrape_error{err="dial redis: unknown network redis"} 1`
+	want := `test_exporter_last_scrape_error{err="WRONGPASS invalid username-password pair or user is disabled."} 1`
 	body := downloadURL(t, ts.URL+"/metrics")
 	if !strings.Contains(body, want) {
 		t.Errorf(`error, expected string "%s" in body, got body: \n\n%s`, want, body)
@@ -122,7 +122,7 @@ func TestConnectToClusterUsingPasswordFile(t *testing.T) {
 		t.Skipf("TEST_VALKEY_CLUSTER_PASSWORD_URI is not set")
 	}
 	passMap := map[string]string{clusterUri: "redis-password"}
-	wrongPassMap := map[string]string{"redis://redis-cluster-password-wrong:7006": "redis-password"}
+	wrongPassMap := map[string]string{"redis://valkey-cluster-password-wrong:7006": "redis-password"}
 
 	tsts := []struct {
 		name         string

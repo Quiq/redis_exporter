@@ -118,6 +118,16 @@ func (e *Exporter) extractInfoMetrics(ch chan<- prometheus.Metric, info string, 
 		case "Server":
 			e.handleMetricsServer(ch, fieldKey, fieldValue)
 
+		case "TLS":
+			if e.handleMetricsTLS(ch, fieldKey, fieldValue) {
+				continue
+			}
+
+		case "Scripting Engines":
+			if e.handleMetricsScriptingEngines(ch, fieldKey, fieldValue) {
+				continue
+			}
+
 		case "Commandstats":
 			cmd, calls, usecsTotal := e.handleMetricsCommandStats(ch, fieldKey, fieldValue)
 			cmdCount[cmd] = uint64(calls)
@@ -132,21 +142,30 @@ func (e *Exporter) extractInfoMetrics(ch chan<- prometheus.Metric, info string, 
 			e.handleMetricsErrorStats(ch, fieldKey, fieldValue)
 			continue
 
+		case "Threads":
+			e.handleMetricsThreads(ch, fieldKey, fieldValue)
+			continue
+
+		case "Cluster Info":
+			// Valkey 9.1 includes CLUSTER INFO in INFO ALL. It is collected separately.
+			continue
+
 		case "Keyspace":
-			if keysTotal, keysEx, avgTTL, keysCached, ok := parseDBKeyspaceString(fieldKey, fieldValue); ok {
+			if metrics, ok := parseDBKeyspaceString(fieldKey, fieldValue); ok {
 				dbName := fieldKey
 
-				e.registerConstMetricGauge(ch, "db_keys", keysTotal, dbName)
-				e.registerConstMetricGauge(ch, "db_keys_expiring", keysEx, dbName)
-				if keysCached > -1 {
-					e.registerConstMetricGauge(ch, "db_keys_cached", keysCached, dbName)
-				}
-				if avgTTL > -1 {
-					e.registerConstMetricGauge(ch, "db_avg_ttl_seconds", avgTTL, dbName)
+				for _, metric := range metrics {
+					e.registerConstMetricGauge(ch, metric.name, metric.value, dbName)
 				}
 				handledDBs[dbName] = true
 				continue
 			}
+
+		case "Keysizes":
+			if e.options.InclKeysizesMetrics {
+				e.handleMetricsKeysizes(ch, fieldKey, fieldValue)
+			}
+			continue
 
 		case "Sentinel":
 			e.handleMetricsSentinel(ch, fieldKey, fieldValue)
@@ -174,13 +193,17 @@ func (e *Exporter) extractInfoMetrics(ch chan<- prometheus.Metric, info string, 
 	}
 
 	instanceRole := keyValues["role"]
+	instanceMode := keyValues["redis_mode"]
+	if instanceMode == "" {
+		instanceMode = keyValues["server_mode"]
+	}
 
 	lbls := []string{"role", "redis_version", "redis_build_id", "redis_mode", "os", "maxmemory_policy", "tcp_port", "run_id", "process_id", "master_replid"}
 	lblVals := []string{
 		instanceRole,
 		keyValues["redis_version"],
 		keyValues["redis_build_id"],
-		keyValues["redis_mode"],
+		instanceMode,
 		keyValues["os"],
 		keyValues["maxmemory_policy"],
 		keyValues["tcp_port"],
@@ -195,6 +218,10 @@ func (e *Exporter) extractInfoMetrics(ch chan<- prometheus.Metric, info string, 
 	if valkeyReleaseStage, ok := keyValues["valkey_release_stage"]; ok {
 		lbls = append(lbls, "valkey_release_stage")
 		lblVals = append(lblVals, valkeyReleaseStage)
+	}
+	if availabilityZone := keyValues["availability_zone"]; availabilityZone != "" {
+		lbls = append(lbls, "availability_zone")
+		lblVals = append(lblVals, availabilityZone)
 	}
 
 	e.createMetricDescription("instance_info", lbls)
@@ -241,52 +268,71 @@ func (e *Exporter) extractClusterInfoMetrics(ch chan<- prometheus.Metric, info s
 	}
 }
 
-/*
-valid example: db0:keys=1,expires=0,avg_ttl=0,cached_keys=0
-*/
-func parseDBKeyspaceString(inputKey string, inputVal string) (keysTotal float64, keysExpiringTotal float64, avgTTL float64, keysCachedTotal float64, ok bool) {
+type dbKeyspaceMetric struct {
+	name  string
+	value float64
+}
+
+type dbKeyspaceMetricDefinition struct {
+	fields   []string
+	name     string
+	scale    float64
+	required bool
+}
+
+var dbKeyspaceMetricDefinitions = []dbKeyspaceMetricDefinition{
+	{fields: []string{"keys"}, name: "db_keys", scale: 1, required: true},
+	{fields: []string{"expires"}, name: "db_keys_expiring", scale: 1, required: true},
+	{fields: []string{"avg_ttl"}, name: "db_avg_ttl_seconds", scale: 1.0 / 1000},
+	{fields: []string{"cached_keys"}, name: "db_keys_cached", scale: 1},
+	// Redis and Valkey use different names for keys containing expiring sub-items.
+	{fields: []string{"subexpiry", "keys_with_volatile_items"}, name: "db_keys_with_expiring_items", scale: 1},
+}
+
+func parseDBKeyspaceString(inputKey string, inputVal string) (metrics []dbKeyspaceMetric, ok bool) {
 	log.Debugf("parseDBKeyspaceString inputKey: [%s] inputVal: [%s]", inputKey, inputVal)
 
 	if !strings.HasPrefix(inputKey, "db") {
 		log.Debugf("parseDBKeyspaceString inputKey not starting with 'db': [%s]", inputKey)
-		return
+		return nil, false
 	}
 
-	split := strings.Split(inputVal, ",")
-	if len(split) < 2 {
-		log.Debugf("parseDBKeyspaceString strings.Split(inputVal) invalid: %#v", split)
-		return
-	}
-
-	var err error
-	if keysTotal, err = extractVal(split[0]); err != nil {
-		log.Debugf("parseDBKeyspaceString extractVal(split[0]) invalid, err: %s", err)
-		return
-	}
-	if keysExpiringTotal, err = extractVal(split[1]); err != nil {
-		log.Debugf("parseDBKeyspaceString extractVal(split[1]) invalid, err: %s", err)
-		return
-	}
-
-	avgTTL = -1
-	if len(split) > 2 {
-		if avgTTL, err = extractVal(split[2]); err != nil {
-			log.Debugf("parseDBKeyspaceString extractVal(split[2]) invalid, err: %s", err)
-			return
+	fields := make(map[string]string)
+	for part := range strings.SplitSeq(inputVal, ",") {
+		field, value, found := strings.Cut(part, "=")
+		if !found {
+			log.Debugf("parseDBKeyspaceString invalid field: [%s]", part)
+			return nil, false
 		}
-		avgTTL /= 1000
+		fields[field] = value
 	}
 
-	keysCachedTotal = -1
-	if len(split) > 3 {
-		if keysCachedTotal, err = extractVal(split[3]); err != nil {
-			log.Debugf("parseDBKeyspaceString extractVal(split[3]) invalid, err: %s", err)
-			return
+	for _, definition := range dbKeyspaceMetricDefinitions {
+		var value string
+		var found bool
+		for _, field := range definition.fields {
+			if value, found = fields[field]; found {
+				break
+			}
 		}
+
+		if !found {
+			if definition.required {
+				log.Debugf("parseDBKeyspaceString missing required field: [%s]", definition.fields[0])
+				return nil, false
+			}
+			continue
+		}
+
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			log.Debugf("parseDBKeyspaceString invalid field %s=%s, err: %s", definition.fields[0], value, err)
+			return nil, false
+		}
+		metrics = append(metrics, dbKeyspaceMetric{name: definition.name, value: parsed * definition.scale})
 	}
 
-	ok = true
-	return
+	return metrics, true
 }
 
 /*
@@ -423,44 +469,81 @@ func parseMetricsCommandStats(fieldKey string, fieldValue string) (cmd string, c
 	}
 	cmd = strings.TrimPrefix(fieldKey, cmdPrefix)
 
-	splitValue := strings.Split(fieldValue, ",")
-	splitLen := len(splitValue)
-	if splitLen < 3 {
+	var foundCalls, foundUsec, foundRejected, foundFailed bool
+
+	for _, field := range strings.Split(fieldValue, ",") {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name, valStr := parts[0], parts[1]
+
+		var val float64
+		val, err := strconv.ParseFloat(valStr, 64)
+		if err != nil {
+			errorOut = fmt.Errorf("invalid %s: %w", name, err)
+			return cmd, calls, rejectedCalls, failedCalls, usecTotal, extendedStats, errorOut
+		}
+
+		switch name {
+		case "calls":
+			calls = val
+			foundCalls = true
+		case "usec":
+			usecTotal = val
+			foundUsec = true
+		case "rejected_calls":
+			rejectedCalls = val
+			foundRejected = true
+		case "failed_calls":
+			failedCalls = val
+			foundFailed = true
+		}
+	}
+
+	if !foundCalls || !foundUsec {
 		errorOut = errors.New("invalid fieldValue")
 		return
 	}
 
-	// internal error variable
-	var err error
-	calls, err = extractVal(splitValue[0])
-	if err != nil {
-		errorOut = errors.New("invalid splitValue[0]")
-		return
+	// pre 6.2 did not include rejected/failed calls stats
+	extendedStats = foundRejected && foundFailed
+	return
+}
+
+func parseMetricsCommandSlowlogStats(fieldValue string) (count float64, timeMsSum float64, timeMsMax float64, available bool, err error) {
+	var foundCount, foundTimeSum, foundTimeMax bool
+	for _, field := range strings.Split(fieldValue, ",") {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		var target *float64
+		switch parts[0] {
+		case "slowlog_count":
+			target = &count
+			foundCount = true
+		case "slowlog_time_ms_sum":
+			target = &timeMsSum
+			foundTimeSum = true
+		case "slowlog_time_ms_max":
+			target = &timeMsMax
+			foundTimeMax = true
+		default:
+			continue
+		}
+
+		*target, err = strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			return 0, 0, 0, false, fmt.Errorf("invalid %s: %w", parts[0], err)
+		}
 	}
 
-	usecTotal, err = extractVal(splitValue[1])
-	if err != nil {
-		errorOut = errors.New("invalid splitValue[1]")
-		return
+	available = foundCount || foundTimeSum || foundTimeMax
+	if available && (!foundCount || !foundTimeSum || !foundTimeMax) {
+		return 0, 0, 0, false, errors.New("incomplete command slowlog stats")
 	}
-
-	// pre 6.2 did not include rejected/failed calls stats so if we have less than 5 tokens we're done here
-	if splitLen < 5 {
-		return
-	}
-
-	rejectedCalls, err = extractVal(splitValue[3])
-	if err != nil {
-		errorOut = errors.New("invalid rejected_calls while parsing splitValue[3]")
-		return
-	}
-
-	failedCalls, err = extractVal(splitValue[4])
-	if err != nil {
-		errorOut = errors.New("invalid failed_calls while parsing splitValue[4]")
-		return
-	}
-	extendedStats = true
 	return
 }
 
@@ -557,6 +640,18 @@ func (e *Exporter) handleMetricsCommandStats(ch chan<- prometheus.Metric, fieldK
 		e.registerConstMetric(ch, "commands_rejected_calls_total", rejectedCalls, prometheus.CounterValue, cmd)
 		e.registerConstMetric(ch, "commands_failed_calls_total", failedCalls, prometheus.CounterValue, cmd)
 	}
+
+	slowlogCount, slowlogTimeMsSum, slowlogTimeMsMax, slowlogStats, err := parseMetricsCommandSlowlogStats(fieldValue)
+	if err != nil {
+		log.Debugf("parseMetricsCommandSlowlogStats( %s ) err: %s", fieldValue, err)
+	} else if slowlogStats {
+		e.createMetricDescription("commands_slowlog_total", []string{"cmd"})
+		e.createMetricDescription("commands_slowlog_duration_seconds_total", []string{"cmd"})
+		e.createMetricDescription("commands_slowlog_duration_seconds_max", []string{"cmd"})
+		e.registerConstMetric(ch, "commands_slowlog_total", slowlogCount, prometheus.CounterValue, cmd)
+		e.registerConstMetric(ch, "commands_slowlog_duration_seconds_total", slowlogTimeMsSum/1e3, prometheus.CounterValue, cmd)
+		e.registerConstMetricGauge(ch, "commands_slowlog_duration_seconds_max", slowlogTimeMsMax/1e3, cmd)
+	}
 	return
 }
 
@@ -570,5 +665,44 @@ func (e *Exporter) handleMetricsLatencyStats(fieldKey string, fieldValue string,
 func (e *Exporter) handleMetricsErrorStats(ch chan<- prometheus.Metric, fieldKey string, fieldValue string) {
 	if errorPrefix, count, err := parseMetricsErrorStats(fieldKey, fieldValue); err == nil {
 		e.registerConstMetric(ch, "errors_total", count, prometheus.CounterValue, errorPrefix)
+	}
+}
+
+// handleMetricsThreads exports the per IO thread counters that Redis 8 reports
+// in the "# Threads" section of INFO ALL, e.g.
+//
+//	io_thread_0:clients=1,reads=2,writes=3
+//
+// The thread index is exposed as a "thread" label, the same way the per thread
+// active time is exposed.
+func (e *Exporter) handleMetricsThreads(ch chan<- prometheus.Metric, fieldKey string, fieldValue string) {
+	matches := ioThreadRE.FindStringSubmatch(fieldKey)
+	if matches == nil {
+		return
+	}
+	thread := matches[1]
+
+	for _, field := range strings.Split(fieldValue, ",") {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		val, err := strconv.ParseFloat(parts[1], 64)
+		if err != nil {
+			log.Debugf("couldn't parse %s, err: %s", parts[1], err)
+			continue
+		}
+
+		switch parts[0] {
+		case "clients":
+			e.createMetricDescription("io_thread_clients", []string{"thread"})
+			e.registerConstMetric(ch, "io_thread_clients", val, prometheus.GaugeValue, thread)
+		case "reads":
+			e.createMetricDescription("io_thread_reads_processed_total", []string{"thread"})
+			e.registerConstMetric(ch, "io_thread_reads_processed_total", val, prometheus.CounterValue, thread)
+		case "writes":
+			e.createMetricDescription("io_thread_writes_processed_total", []string{"thread"})
+			e.registerConstMetric(ch, "io_thread_writes_processed_total", val, prometheus.CounterValue, thread)
+		}
 	}
 }

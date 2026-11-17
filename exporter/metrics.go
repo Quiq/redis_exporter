@@ -3,6 +3,7 @@ package exporter
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,8 @@ import (
 )
 
 var metricNameRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+var activeTimeIOThreadRE = regexp.MustCompile(`^used_active_time_io_thread_([0-9]+)$`)
+var ioThreadRE = regexp.MustCompile(`^io_thread_([0-9]+)$`)
 
 func sanitizeMetricName(n string) string {
 	return metricNameRE.ReplaceAllString(n, "_")
@@ -24,6 +27,9 @@ func (e *Exporter) includeMetric(s string) bool {
 	if strings.HasPrefix(s, "db") || strings.HasPrefix(s, "cmdstat_") || strings.HasPrefix(s, "cluster_") {
 		return true
 	}
+	if activeTimeIOThreadRE.MatchString(s) {
+		return true
+	}
 	if _, ok := e.metricMapGauges[s]; ok {
 		return true
 	}
@@ -33,6 +39,17 @@ func (e *Exporter) includeMetric(s string) bool {
 }
 
 func (e *Exporter) parseAndRegisterConstMetric(ch chan<- prometheus.Metric, fieldKey, fieldValue string) {
+	if matches := activeTimeIOThreadRE.FindStringSubmatch(fieldKey); matches != nil {
+		val, err := strconv.ParseFloat(fieldValue, 64)
+		if err != nil {
+			log.Debugf("couldn't parse %s, err: %s", fieldValue, err)
+			return
+		}
+		e.createMetricDescription("active_time_io_thread_seconds_total", []string{"thread"})
+		e.registerConstMetric(ch, "active_time_io_thread_seconds_total", val, prometheus.CounterValue, matches[1])
+		return
+	}
+
 	orgMetricName := sanitizeMetricName(fieldKey)
 	metricName := orgMetricName
 	if newName, ok := e.metricMapGauges[metricName]; ok {
@@ -72,6 +89,8 @@ func (e *Exporter) parseAndRegisterConstMetric(ch chan<- prometheus.Metric, fiel
 	case "latest_fork_usec":
 		metricName = "latest_fork_seconds"
 		val = val / 1e6
+	case "slowlog_commands_duration_seconds_max", "slowlog_commands_duration_seconds_total":
+		val /= 1e3
 	}
 
 	e.registerConstMetric(ch, metricName, val, t)
@@ -137,13 +156,22 @@ func (e *Exporter) mustFindMetricDescription(metricName string) *prometheus.Desc
 }
 
 func (e *Exporter) createMetricDescription(metricName string, labels []string) *prometheus.Desc {
-	if desc, found := e.metricDescriptions[metricName]; found {
-		return desc
-	}
 	if e.options.AppendInstanceRoleLabel && metricName != "exporter_last_scrape_connect_time_seconds" && metricName != "exporter_last_scrape_ping_time_seconds" {
 		labels = append(labels, "instance_role") // append instance_role label to all metrics (except 2 collected before instanceRole)
 	}
+
+	if desc, found := e.metricDescriptions[metricName]; found {
+		// rebuild when a dynamic-label metric changes its labels at runtime
+		if len(labels) == 0 || slices.Equal(e.metricDescriptionLabels[metricName], labels) {
+			return desc
+		}
+	}
+
+	if e.metricDescriptionLabels == nil {
+		e.metricDescriptionLabels = map[string][]string{}
+	}
 	d := newMetricDescr(e.options.Namespace, metricName, metricName+" metric", labels, e.constLabels)
 	e.metricDescriptions[metricName] = d
+	e.metricDescriptionLabels[metricName] = labels
 	return d
 }

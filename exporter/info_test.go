@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"fmt"
+	"math"
 	"net/http/httptest"
 	"os"
 	"reflect"
@@ -9,57 +10,357 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gomodule/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 )
 
 func TestKeyspaceStringParser(t *testing.T) {
 	tsts := []struct {
-		db                                    string
-		stats                                 string
-		keysTotal, keysEx, keysCached, avgTTL float64
-		ok                                    bool
+		name    string
+		db      string
+		stats   string
+		metrics []dbKeyspaceMetric
+		ok      bool
 	}{
-		{db: "xxx", stats: "", ok: false},
-		{db: "xxx", stats: "keys=1,expires=0,avg_ttl=0", ok: false},
-		{db: "db0", stats: "xxx", ok: false},
-		{db: "db1", stats: "keys=abcd,expires=0,avg_ttl=0", ok: false},
-		{db: "db2", stats: "keys=1234=1234,expires=0,avg_ttl=0", ok: false},
-
-		{db: "db3", stats: "keys=abcde,expires=0", ok: false},
-		{db: "db3", stats: "keys=213,expires=xxx", ok: false},
-		{db: "db3", stats: "keys=123,expires=0,avg_ttl=zzz", ok: false},
-		{db: "db3", stats: "keys=1,expires=0,avg_ttl=zzz,cached_keys=0", ok: false},
-		{db: "db3", stats: "keys=1,expires=0,avg_ttl=0,cached_keys=zzz", ok: false},
-		{db: "db3", stats: "keys=1,expires=0,avg_ttl=0,cached_keys=0,extra=0", keysTotal: 1, keysEx: 0, avgTTL: 0, keysCached: 0, ok: true},
-
-		{db: "db0", stats: "keys=1,expires=0,avg_ttl=0", keysTotal: 1, keysEx: 0, avgTTL: 0, keysCached: -1, ok: true},
-		{db: "db0", stats: "keys=1,expires=0,avg_ttl=0,cached_keys=0", keysTotal: 1, keysEx: 0, avgTTL: 0, keysCached: 0, ok: true},
-
 		{
-			db: "db0", stats: "keys=25714011,expires=25091314,avg_ttl=685620459,subexpiry=0",
-			keysTotal: 25714011, keysEx: 25091314, keysCached: 0, avgTTL: 685620.459000,
-			ok: true,
+			name: "wrong key prefix", db: "xxx", stats: "keys=1,expires=0,avg_ttl=0", ok: false,
+		},
+		{name: "malformed", db: "db0", stats: "xxx", ok: false},
+		{name: "invalid keys", db: "db1", stats: "keys=abcd,expires=0,avg_ttl=0", ok: false},
+		{name: "invalid field", db: "db2", stats: "keys=1234=1234,expires=0,avg_ttl=0", ok: false},
+		{name: "missing keys", db: "db3", stats: "expires=0,avg_ttl=0", ok: false},
+		{name: "missing expires", db: "db3", stats: "keys=213,avg_ttl=0", ok: false},
+		{name: "invalid expires", db: "db3", stats: "keys=213,expires=xxx", ok: false},
+		{name: "invalid average ttl", db: "db3", stats: "keys=123,expires=0,avg_ttl=zzz", ok: false},
+		{name: "invalid cached keys", db: "db3", stats: "keys=1,expires=0,avg_ttl=0,cached_keys=zzz", ok: false},
+		{
+			name: "redis without subexpiry", db: "db0", stats: "keys=1,expires=0,avg_ttl=2000",
+			metrics: []dbKeyspaceMetric{{name: "db_keys", value: 1}, {name: "db_keys_expiring", value: 0}, {name: "db_avg_ttl_seconds", value: 2}}, ok: true,
+		},
+		{
+			name: "redis subexpiry", db: "db0", stats: "subexpiry=7,avg_ttl=685620459,expires=25091314,keys=25714011",
+			metrics: []dbKeyspaceMetric{{name: "db_keys", value: 25714011}, {name: "db_keys_expiring", value: 25091314}, {name: "db_avg_ttl_seconds", value: 685620.459}, {name: "db_keys_with_expiring_items", value: 7}}, ok: true,
+		},
+		{
+			name: "valkey volatile items", db: "db0", stats: "keys=17,expires=5,avg_ttl=2500,keys_with_volatile_items=3",
+			metrics: []dbKeyspaceMetric{{name: "db_keys", value: 17}, {name: "db_keys_expiring", value: 5}, {name: "db_avg_ttl_seconds", value: 2.5}, {name: "db_keys_with_expiring_items", value: 3}}, ok: true,
+		},
+		{
+			name: "cached keys compatibility", db: "db0", stats: "keys=1,expires=0,avg_ttl=0,cached_keys=4,extra=ignored",
+			metrics: []dbKeyspaceMetric{{name: "db_keys", value: 1}, {name: "db_keys_expiring", value: 0}, {name: "db_avg_ttl_seconds", value: 0}, {name: "db_keys_cached", value: 4}}, ok: true,
 		},
 	}
 
 	for _, tst := range tsts {
-		if kt, kx, ttl, kc, ok := parseDBKeyspaceString(tst.db, tst.stats); true {
-
+		t.Run(tst.name, func(t *testing.T) {
+			metrics, ok := parseDBKeyspaceString(tst.db, tst.stats)
 			if ok != tst.ok {
-				t.Errorf("failed for: db:%s stats:%s", tst.db, tst.stats)
+				t.Fatalf("parseDBKeyspaceString(%q, %q) ok = %t, want %t", tst.db, tst.stats, ok, tst.ok)
+			}
+
+			if ok && !reflect.DeepEqual(metrics, tst.metrics) {
+				t.Errorf("parseDBKeyspaceString(%q, %q) metrics = %#v, want %#v", tst.db, tst.stats, metrics, tst.metrics)
+			}
+		})
+	}
+}
+
+func TestExtractInfoKeyspaceMetrics(t *testing.T) {
+	tests := []struct {
+		name     string
+		keyspace string
+		want     []string
+		dontWant []string
+	}{
+		{
+			name: "redis", keyspace: "db0:keys=5,expires=3,avg_ttl=1000,subexpiry=2",
+			want:     []string{"test_db_keys", "test_db_keys_expiring", "test_db_avg_ttl_seconds", "test_db_keys_with_expiring_items"},
+			dontWant: []string{"test_db_keys_cached"},
+		},
+		{
+			name: "valkey", keyspace: "db0:keys=5,expires=3,avg_ttl=1000,keys_with_volatile_items=2",
+			want:     []string{"test_db_keys", "test_db_keys_expiring", "test_db_avg_ttl_seconds", "test_db_keys_with_expiring_items"},
+			dontWant: []string{"test_db_keys_cached"},
+		},
+		{
+			name: "cached keys compatibility", keyspace: "db0:keys=5,expires=3,avg_ttl=1000,cached_keys=2",
+			want:     []string{"test_db_keys", "test_db_keys_expiring", "test_db_avg_ttl_seconds", "test_db_keys_cached"},
+			dontWant: []string{"test_db_keys_with_expiring_items"},
+		},
+	}
+
+	for _, tst := range tests {
+		t.Run(tst.name, func(t *testing.T) {
+			e, err := NewRedisExporter("unix:///tmp/doesnt.matter", Options{Namespace: "test"})
+			if err != nil {
+				t.Fatalf("NewRedisExporter() error = %v", err)
+			}
+
+			ch := make(chan prometheus.Metric)
+			go func() {
+				e.extractInfoMetrics(ch, "# Keyspace\n"+tst.keyspace+"\n", 0)
+				close(ch)
+			}()
+
+			descriptions := ""
+			for metric := range ch {
+				descriptions += metric.Desc().String() + "\n"
+			}
+			for _, metric := range tst.want {
+				if !strings.Contains(descriptions, `fqName: "`+metric+`"`) {
+					t.Errorf("missing metric %s", metric)
+				}
+			}
+			for _, metric := range tst.dontWant {
+				if strings.Contains(descriptions, `fqName: "`+metric+`"`) {
+					t.Errorf("unexpected metric %s", metric)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractInfoThreadsMetrics(t *testing.T) {
+	info := "# Threads\n" +
+		"io_thread_0:clients=1,reads=2,writes=3\n" +
+		"io_thread_1:clients=4,reads=5,writes=6\n"
+
+	want := map[string]map[string]float64{
+		"test_io_thread_clients":                {"0": 1, "1": 4},
+		"test_io_thread_reads_processed_total":  {"0": 2, "1": 5},
+		"test_io_thread_writes_processed_total": {"0": 3, "1": 6},
+	}
+
+	e, err := NewRedisExporter("unix:///tmp/doesnt.matter", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() error = %v", err)
+	}
+
+	got := collectThreadMetrics(t, e, info)
+
+	for name, threads := range want {
+		for thread, wantValue := range threads {
+			gotValue, ok := got[name][thread]
+			if !ok {
+				t.Errorf("missing metric %s{thread=%q}", name, thread)
 				continue
 			}
-
-			if ok && (kt != tst.keysTotal || kx != tst.keysEx || kc != tst.keysCached || ttl != tst.avgTTL) {
-				t.Errorf("values not matching, db:%s stats:%s   %f != %f   %f != %f  %f != %f  %f != %f",
-					tst.db, tst.stats,
-					kt, tst.keysTotal,
-					kx, tst.keysEx,
-					kc, tst.keysCached,
-					ttl, tst.avgTTL)
+			if gotValue != wantValue {
+				t.Errorf("%s{thread=%q} = %v, want %v", name, thread, gotValue, wantValue)
 			}
 		}
+	}
+}
+
+// A line of the section that is not a thread, a field without a value and a
+// value that is not a number are all skipped instead of breaking the scrape.
+func TestExtractInfoThreadsMetricsSkipsMalformedEntries(t *testing.T) {
+	info := "# Threads\n" +
+		"not_a_thread:clients=1\n" +
+		"io_thread_0:clients,reads=2,writes=3\n" +
+		"io_thread_1:clients=abc,reads=5,writes=6\n"
+
+	want := map[string]map[string]float64{
+		"test_io_thread_clients":                {},
+		"test_io_thread_reads_processed_total":  {"0": 2, "1": 5},
+		"test_io_thread_writes_processed_total": {"0": 3, "1": 6},
+	}
+
+	e, err := NewRedisExporter("unix:///tmp/doesnt.matter", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() error = %v", err)
+	}
+
+	got := collectThreadMetrics(t, e, info)
+
+	for name, threads := range want {
+		if len(got[name]) != len(threads) {
+			t.Errorf("%s has %d threads, want %d: %v", name, len(got[name]), len(threads), got[name])
+		}
+		for thread, wantValue := range threads {
+			gotValue, ok := got[name][thread]
+			if !ok {
+				t.Errorf("missing metric %s{thread=%q}", name, thread)
+				continue
+			}
+			if gotValue != wantValue {
+				t.Errorf("%s{thread=%q} = %v, want %v", name, thread, gotValue, wantValue)
+			}
+		}
+	}
+}
+
+// collectThreadMetrics extracts the per-thread metrics of one INFO section.
+func collectThreadMetrics(t *testing.T, e *Exporter, info string) map[string]map[string]float64 {
+	t.Helper()
+
+	names := []string{
+		"test_io_thread_clients",
+		"test_io_thread_reads_processed_total",
+		"test_io_thread_writes_processed_total",
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		e.extractInfoMetrics(ch, info, 0)
+		close(ch)
+	}()
+
+	got := map[string]map[string]float64{}
+	for metric := range ch {
+		desc := metric.Desc().String()
+		name := ""
+		for _, candidate := range names {
+			if strings.Contains(desc, `fqName: "`+candidate+`"`) {
+				name = candidate
+				break
+			}
+		}
+		if name == "" {
+			continue
+		}
+		m := &dto.Metric{}
+		if err := metric.Write(m); err != nil {
+			t.Fatalf("metric.Write() err: %s", err)
+		}
+		var value float64
+		if m.Gauge != nil {
+			value = m.GetGauge().GetValue()
+		} else if m.Counter != nil {
+			value = m.GetCounter().GetValue()
+		}
+		thread := ""
+		for _, label := range m.GetLabel() {
+			if label.GetName() == "thread" {
+				thread = label.GetValue()
+			}
+		}
+		if got[name] == nil {
+			got[name] = map[string]float64{}
+		}
+		got[name][thread] = value
+	}
+	return got
+}
+
+// The per-thread metrics of the "# Threads" section, checked against a Redis
+// running with several IO threads.
+func TestLiveThreadsMetricsOnMultiThreadRedis(t *testing.T) {
+	// The instance is the redis8-io-threads service of docker-compose.yml;
+	// CI sets the variable to the port that service publishes.
+	addr := os.Getenv("TEST_REDIS_IO_THREADS_URI")
+	if addr == "" {
+		t.Skipf("TEST_REDIS_IO_THREADS_URI not set - skipping")
+	}
+
+	e, err := NewRedisExporter(addr, Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() error = %v", err)
+	}
+
+	c, err := e.connectToRedis()
+	if err != nil {
+		t.Fatalf("connectToRedis() error = %v", err)
+	}
+	defer c.Close()
+
+	info, err := redis.String(c.Do("INFO", "ALL"))
+	if err != nil {
+		t.Fatalf("INFO ALL error = %v", err)
+	}
+	threads := regexp.MustCompile(`(?m)^io_thread_(\d+):`).FindAllStringSubmatch(info, -1)
+	if len(threads) < 2 {
+		t.Fatalf("expected a Redis with several IO threads, got %d:\n%s", len(threads), info)
+	}
+
+	ts := httptest.NewServer(e)
+	defer ts.Close()
+	body := downloadURL(t, ts.URL+"/metrics")
+
+	for _, match := range threads {
+		thread := match[1]
+		for _, name := range []string{
+			"test_io_thread_clients",
+			"test_io_thread_reads_processed_total",
+			"test_io_thread_writes_processed_total",
+		} {
+			pattern := regexp.MustCompile(
+				`(?m)^` + regexp.QuoteMeta(name) + `\{[^}]*thread="` + thread + `"[^}]*\} `,
+			)
+			if !pattern.MatchString(body) {
+				t.Errorf("missing metric %s for thread %s:\n%s", name, thread, body)
+			}
+		}
+	}
+}
+
+func TestLiveKeyspaceExpiringItemsMetric(t *testing.T) {
+	tests := []struct {
+		name        string
+		env         string
+		sourceField string
+	}{
+		{name: "redis", env: "TEST_REDIS88_URI", sourceField: "subexpiry"},
+		{name: "valkey", env: "TEST_VALKEY9_URI", sourceField: "keys_with_volatile_items"},
+	}
+
+	for _, tst := range tests {
+		t.Run(tst.name, func(t *testing.T) {
+			addr := os.Getenv(tst.env)
+			if addr == "" {
+				t.Skipf("%s not set - skipping", tst.env)
+			}
+
+			e, err := NewRedisExporter(addr, Options{Namespace: "test"})
+			if err != nil {
+				t.Fatalf("NewRedisExporter() error = %v", err)
+			}
+			c, err := e.connectToRedis()
+			if err != nil {
+				t.Fatalf("connectToRedis() error = %v", err)
+			}
+			defer c.Close()
+
+			const db = "15"
+			if _, err := c.Do("SELECT", db); err != nil {
+				t.Fatalf("SELECT %s error = %v", db, err)
+			}
+			if _, err := c.Do("FLUSHDB"); err != nil {
+				t.Fatalf("FLUSHDB error = %v", err)
+			}
+			defer c.Do("FLUSHDB")
+
+			if _, err := c.Do("HSET", "expiring-items-test", "field", "value"); err != nil {
+				t.Fatalf("HSET error = %v", err)
+			}
+			result, err := redis.Ints(c.Do("HEXPIRE", "expiring-items-test", 600, "FIELDS", 1, "field"))
+			if err != nil {
+				t.Fatalf("HEXPIRE error = %v", err)
+			}
+			if !reflect.DeepEqual(result, []int{1}) {
+				t.Fatalf("HEXPIRE result = %v, want [1]", result)
+			}
+
+			info, err := redis.String(c.Do("INFO", "KEYSPACE"))
+			if err != nil {
+				t.Fatalf("INFO KEYSPACE error = %v", err)
+			}
+			if !strings.Contains(info, tst.sourceField+"=1") {
+				t.Fatalf("INFO KEYSPACE missing %s=1:\n%s", tst.sourceField, info)
+			}
+
+			ts := httptest.NewServer(e)
+			defer ts.Close()
+			body := downloadURL(t, ts.URL+"/metrics")
+			if want := `test_db_keys_with_expiring_items{db="db15"} 1`; !strings.Contains(body, want) {
+				t.Errorf("missing metric %q:\n%s", want, body)
+			}
+			if strings.Contains(body, `test_db_keys_cached{db="db15"}`) {
+				t.Errorf("unexpected cached-keys metric for db15:\n%s", body)
+			}
+		})
 	}
 }
 
@@ -121,6 +422,42 @@ func TestCommandStats(t *testing.T) {
 	}
 }
 
+func TestValkeyClusterInfoMetricsNotDuplicated(t *testing.T) {
+	e, err := NewRedisExporter("unix:///tmp/doesnt.matter", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() err: %s", err)
+	}
+
+	clusterInfo := "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n"
+	infoAll := "# Cluster\r\ncluster_enabled:1\r\n# Cluster Info\r\n" + clusterInfo
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		e.extractClusterInfoMetrics(ch, clusterInfo)
+		e.extractInfoMetrics(ch, infoAll, 1)
+		close(ch)
+	}()
+
+	counts := map[string]int{
+		"test_cluster_state":          0,
+		"test_cluster_slots_assigned": 0,
+	}
+	for metric := range ch {
+		desc := metric.Desc().String()
+		for name := range counts {
+			if strings.Contains(desc, `fqName: "`+name+`"`) {
+				counts[name]++
+			}
+		}
+	}
+
+	for name, count := range counts {
+		if count != 1 {
+			t.Errorf("%s emitted %d times, want 1", name, count)
+		}
+	}
+}
+
 func commandStatsCheck(t *testing.T, e *Exporter, want map[string]bool) {
 	chM := make(chan prometheus.Metric)
 	go func() {
@@ -173,11 +510,11 @@ func TestInclMetricsForEmptyDatabases(t *testing.T) {
 }
 
 func TestClusterMaster(t *testing.T) {
-	if os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI") == "" {
-		t.Skipf("TEST_REDIS_CLUSTER_MASTER_URI not set - skipping")
+	if os.Getenv("TEST_VALKEY_CLUSTER_MASTER_URI") == "" {
+		t.Skipf("TEST_VALKEY_CLUSTER_MASTER_URI not set - skipping")
 	}
 
-	addr := os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI")
+	addr := os.Getenv("TEST_VALKEY_CLUSTER_MASTER_URI")
 	e, _ := NewRedisExporter(addr, Options{Namespace: "test"})
 	ts := httptest.NewServer(e)
 	defer ts.Close()
@@ -195,10 +532,10 @@ func TestClusterMaster(t *testing.T) {
 }
 
 func TestClusterSkipCheckKeysIfMaster(t *testing.T) {
-	uriMaster := os.Getenv("TEST_REDIS_CLUSTER_MASTER_URI")
-	uriSlave := os.Getenv("TEST_REDIS_CLUSTER_SLAVE_URI")
+	uriMaster := os.Getenv("TEST_VALKEY_CLUSTER_MASTER_URI")
+	uriSlave := os.Getenv("TEST_VALKEY_CLUSTER_SLAVE_URI")
 	if uriMaster == "" || uriSlave == "" {
-		t.Skipf("TEST_REDIS_CLUSTER_MASTER_URI or slave not set - skipping")
+		t.Skipf("TEST_VALKEY_CLUSTER_MASTER_URI or slave not set - skipping")
 	}
 
 	setupTestKeysCluster(t, uriMaster)
@@ -242,11 +579,11 @@ func TestClusterSkipCheckKeysIfMaster(t *testing.T) {
 }
 
 func TestClusterSlave(t *testing.T) {
-	if os.Getenv("TEST_REDIS_CLUSTER_SLAVE_URI") == "" {
-		t.Skipf("TEST_REDIS_CLUSTER_SLAVE_URI not set - skipping")
+	if os.Getenv("TEST_VALKEY_CLUSTER_SLAVE_URI") == "" {
+		t.Skipf("TEST_VALKEY_CLUSTER_SLAVE_URI not set - skipping")
 	}
 
-	addr := os.Getenv("TEST_REDIS_CLUSTER_SLAVE_URI")
+	addr := os.Getenv("TEST_VALKEY_CLUSTER_SLAVE_URI")
 	e, _ := NewRedisExporter(addr, Options{Namespace: "test"})
 	ts := httptest.NewServer(e)
 	defer ts.Close()
@@ -353,10 +690,21 @@ func TestParseCommandStats(t *testing.T) {
 			fieldValue:  "calls=75,usec=1024,usec_per_call=16.80,rejected_calls=5,failed_calls=ABC",
 			wantSuccess: false,
 		},
+		{
+			fieldKey:          "cmdstat_xtrim",
+			fieldValue:        "calls=21875,failed_calls=0,rejected_calls=0,usec=1435017,usec_per_call=65.6",
+			wantCmd:           "xtrim",
+			wantCalls:         21875,
+			wantUsecTotal:     1435017,
+			wantSuccess:       true,
+			wantExtraStats:    true,
+			wantFailedCalls:   0,
+			wantRejectedCalls: 0,
+		},
 	} {
 		t.Run(tst.fieldKey+tst.fieldValue, func(t *testing.T) {
 
-			cmd, calls, rejectedCalls, failedCalls, usecTotal, _, err := parseMetricsCommandStats(tst.fieldKey, tst.fieldValue)
+			cmd, calls, rejectedCalls, failedCalls, usecTotal, extendedStats, err := parseMetricsCommandStats(tst.fieldKey, tst.fieldValue)
 
 			if tst.wantSuccess && err != nil {
 				t.Fatalf("err: %s", err)
@@ -388,9 +736,154 @@ func TestParseCommandStats(t *testing.T) {
 			if usecTotal != tst.wantUsecTotal {
 				t.Fatalf("cmd not matching, got: %f, wanted: %f", usecTotal, tst.wantUsecTotal)
 			}
+			if extendedStats != tst.wantExtraStats {
+				t.Fatalf("extendedStats not matching, got: %t, wanted: %t", extendedStats, tst.wantExtraStats)
+			}
 		})
 	}
 
+}
+
+func TestParseCommandSlowlogStats(t *testing.T) {
+	for _, test := range []struct {
+		name                        string
+		value                       string
+		wantCount, wantSum, wantMax float64
+		wantAvailable, wantError    bool
+	}{
+		{
+			name:          "absent",
+			value:         "calls=2,usec=10,usec_per_call=5.00,rejected_calls=0,failed_calls=0",
+			wantAvailable: false,
+		},
+		{
+			name:          "redis 8.8",
+			value:         "calls=2,usec=10,usec_per_call=5.00,rejected_calls=0,failed_calls=0,ignored,slowlog_count=2,slowlog_time_ms_sum=125.50,slowlog_time_ms_max=75.25",
+			wantCount:     2,
+			wantSum:       125.5,
+			wantMax:       75.25,
+			wantAvailable: true,
+		},
+		{
+			name:      "incomplete",
+			value:     "calls=2,slowlog_count=2",
+			wantError: true,
+		},
+		{
+			name:      "invalid",
+			value:     "calls=2,slowlog_count=nope,slowlog_time_ms_sum=1,slowlog_time_ms_max=1",
+			wantError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			count, sum, max, available, err := parseMetricsCommandSlowlogStats(test.value)
+			if (err != nil) != test.wantError {
+				t.Fatalf("parseMetricsCommandSlowlogStats() err = %v, wantError %t", err, test.wantError)
+			}
+			if count != test.wantCount || sum != test.wantSum || max != test.wantMax || available != test.wantAvailable {
+				t.Errorf("parseMetricsCommandSlowlogStats() = (%v, %v, %v, %t), want (%v, %v, %v, %t)", count, sum, max, available, test.wantCount, test.wantSum, test.wantMax, test.wantAvailable)
+			}
+		})
+	}
+}
+
+func TestCommandStatsIgnoreMalformedSlowlogStats(t *testing.T) {
+	e := getTestExporterWithOptions(t, Options{Namespace: "test"})
+	ch := make(chan prometheus.Metric, 8)
+	cmd, calls, usec := e.handleMetricsCommandStats(ch, "cmdstat_get", "calls=2,usec=10,usec_per_call=5.00,rejected_calls=0,failed_calls=0,slowlog_count=2")
+	close(ch)
+
+	if cmd != "get" || calls != 2 || usec != 10 {
+		t.Fatalf("base command stats = (%q, %v, %v), want (get, 2, 10)", cmd, calls, usec)
+	}
+	for metric := range ch {
+		if strings.Contains(metric.Desc().String(), "commands_slowlog_") {
+			t.Errorf("malformed slowlog stats emitted a metric: %s", metric.Desc())
+		}
+	}
+}
+
+func TestRedisEightEightInfoMetrics(t *testing.T) {
+	e, err := NewRedisExporter("redis://localhost:6379", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() err: %s", err)
+	}
+	info := `# Clients
+active_clients:4
+# Stats
+eventloop_cycles_with_clients_processing:11
+total_client_processing_events:12
+avg_pipeline_length_sum:30
+avg_pipeline_length_cnt:10
+avg_pipeline_length:3.00
+slowlog_commands_count:7
+slowlog_commands_time_ms_max:400.00
+slowlog_commands_time_ms_sum:1250.00
+# Commandstats
+cmdstat_xnack:calls=4,usec=40,usec_per_call=10.00,rejected_calls=0,failed_calls=0,slowlog_count=2,slowlog_time_ms_sum=300.00,slowlog_time_ms_max=200.00
+`
+
+	type expectedMetric struct {
+		value   float64
+		counter bool
+		found   bool
+	}
+	want := map[string]*expectedMetric{
+		"active_clients": {value: 4},
+		"eventloop_cycles_with_clients_processing_total": {value: 11, counter: true},
+		"client_processing_events_total":                 {value: 12, counter: true},
+		"client_processing_pipeline_commands_total":      {value: 30, counter: true},
+		"client_processing_pipeline_batches_total":       {value: 10, counter: true},
+		"client_processing_pipeline_length":              {value: 3},
+		"slowlog_commands_total":                         {value: 7, counter: true},
+		"slowlog_commands_duration_seconds_max":          {value: 0.4},
+		"slowlog_commands_duration_seconds_total":        {value: 1.25, counter: true},
+		"commands_slowlog_total":                         {value: 2, counter: true},
+		"commands_slowlog_duration_seconds_total":        {value: 0.3, counter: true},
+		"commands_slowlog_duration_seconds_max":          {value: 0.2},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		e.extractInfoMetrics(ch, info, 0)
+		close(ch)
+	}()
+	for metric := range ch {
+		desc := metric.Desc().String()
+		for name, expected := range want {
+			if !strings.Contains(desc, `fqName: "test_`+name+`"`) {
+				continue
+			}
+			var got dto.Metric
+			if err := metric.Write(&got); err != nil {
+				t.Fatalf("metric.Write(%s) err: %s", name, err)
+			}
+			var value float64
+			if expected.counter {
+				if got.Counter == nil {
+					t.Errorf("%s is not a counter", name)
+					continue
+				}
+				value = got.Counter.GetValue()
+			} else {
+				if got.Gauge == nil {
+					t.Errorf("%s is not a gauge", name)
+					continue
+				}
+				value = got.Gauge.GetValue()
+			}
+			if math.Abs(value-expected.value) > 1e-9 {
+				t.Errorf("%s value = %v, want %v", name, value, expected.value)
+			}
+			expected.found = true
+		}
+	}
+
+	for name, expected := range want {
+		if !expected.found {
+			t.Errorf("metric %s was not emitted", name)
+		}
+	}
 }
 
 func TestParseErrorStats(t *testing.T) {
@@ -524,6 +1017,138 @@ func Test_parseMetricsLatencyStats(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotPercentileMap, tt.wantPercentileMap) {
 				t.Errorf("parseMetricsLatencyStats() gotPercentileMap = %v, want %v", gotPercentileMap, tt.wantPercentileMap)
+			}
+		})
+	}
+}
+
+func TestHandleMetricsLatencyStats(t *testing.T) {
+	e := &Exporter{}
+	got := map[string]map[float64]float64{}
+
+	e.handleMetricsLatencyStats("latency_percentiles_usec_ping", "p50=0.001,p99=1.003", got)
+	want := map[string]map[float64]float64{"ping": {50: 0.001, 99: 1.003}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("handleMetricsLatencyStats() = %#v, want %#v", got, want)
+	}
+
+	e.handleMetricsLatencyStats("invalid", "p50=1", got)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("invalid latency stats changed the result: %#v", got)
+	}
+}
+
+// instance_info must survive a Valkey 8.0 -> 8.1 upgrade that adds the new
+// valkey_release_stage INFO field between scrapes, without a restart.
+func TestInstanceInfoLabelsChangeBetweenScrapes(t *testing.T) {
+	e, err := NewRedisExporter("redis://localhost:6379", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() err: %s", err)
+	}
+	// force the lazy init of metricDescriptionLabels on the first scrape
+	e.metricDescriptionLabels = nil
+
+	// Valkey 8.0 has no valkey_release_stage field
+	infoBefore := "# Server\r\nredis_version:7.2.5\r\nredis_mode:standalone\r\nrun_id:abc\r\nvalkey_version:8.0.0\r\n"
+	// Valkey 8.1 added valkey_release_stage
+	infoAfter := "# Server\r\nredis_version:7.2.5\r\nredis_mode:standalone\r\nrun_id:abc\r\nvalkey_version:8.1.0\r\nvalkey_release_stage:ga\r\n"
+
+	descs := make([]string, 2)
+	for i, info := range []string{infoBefore, infoAfter} {
+		ch := make(chan prometheus.Metric)
+		go func() {
+			e.extractInfoMetrics(ch, info, 0)
+			close(ch)
+		}()
+
+		for m := range ch {
+			if strings.Contains(m.Desc().String(), "test_instance_info") {
+				descs[i] = m.Desc().String()
+			}
+		}
+		if descs[i] == "" {
+			t.Fatalf("scrape %d: test_instance_info metric missing after the instance_info label set changed", i)
+		}
+	}
+
+	// the description must be rebuilt with the new label set, not the stale cached one
+	if strings.Contains(descs[0], "valkey_release_stage") {
+		t.Errorf("first scrape unexpectedly exposed valkey_release_stage label:\n%s", descs[0])
+	}
+	if !strings.Contains(descs[1], "valkey_release_stage") {
+		t.Errorf("second scrape missing new valkey_release_stage label after the upgrade:\n%s", descs[1])
+	}
+
+	// a metric with no explicit labels must always return the cached description
+	noLabel := e.createMetricDescription("uptime_in_seconds", nil)
+	if noLabel != e.createMetricDescription("uptime_in_seconds", nil) {
+		t.Errorf("expected cached description to be reused for a metric without labels")
+	}
+}
+
+func TestInstanceInfoModeCompatibilityAndAvailabilityZone(t *testing.T) {
+	tests := []struct {
+		name             string
+		info             string
+		wantMode         string
+		wantAvailability string
+	}{
+		{
+			name:             "valkey 9",
+			info:             "# Server\nserver_mode:cluster\nvalkey_version:9.1.0\navailability_zone:zone-a\n",
+			wantMode:         "cluster",
+			wantAvailability: "zone-a",
+		},
+		{
+			name:     "valkey 8",
+			info:     "# Server\nserver_mode:standalone\nvalkey_version:8.1.9\navailability_zone:\n",
+			wantMode: "standalone",
+		},
+		{
+			name:     "redis",
+			info:     "# Server\nredis_mode:sentinel\nredis_version:8.2.0\n",
+			wantMode: "sentinel",
+		},
+	}
+
+	for _, tst := range tests {
+		t.Run(tst.name, func(t *testing.T) {
+			e, err := NewRedisExporter("redis://localhost:6379", Options{Namespace: "test"})
+			if err != nil {
+				t.Fatalf("NewRedisExporter() err: %s", err)
+			}
+
+			ch := make(chan prometheus.Metric)
+			go func() {
+				e.extractInfoMetrics(ch, tst.info, 0)
+				close(ch)
+			}()
+
+			var labels map[string]string
+			for metric := range ch {
+				if !strings.Contains(metric.Desc().String(), `fqName: "test_instance_info"`) {
+					continue
+				}
+				got := &dto.Metric{}
+				if err := metric.Write(got); err != nil {
+					t.Fatalf("metric.Write() err: %s", err)
+				}
+				labels = metricLabels(got)
+			}
+
+			if labels == nil {
+				t.Fatal("instance_info metric missing")
+			}
+			if labels["redis_mode"] != tst.wantMode {
+				t.Errorf("redis_mode = %q, want %q", labels["redis_mode"], tst.wantMode)
+			}
+			availability, hasAvailability := labels["availability_zone"]
+			if tst.wantAvailability == "" {
+				if hasAvailability {
+					t.Errorf("availability_zone = %q, want label omitted", availability)
+				}
+			} else if !hasAvailability || availability != tst.wantAvailability {
+				t.Errorf("availability_zone = %q, want %q", availability, tst.wantAvailability)
 			}
 		})
 	}

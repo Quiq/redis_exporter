@@ -14,7 +14,7 @@ func newRdbTestExporter() *Exporter {
 	return &Exporter{
 		options: Options{Namespace: "test"},
 		metricDescriptions: map[string]*prometheus.Desc{
-			"rdb_current_size_bytes": newMetricDescr("test", "rdb_current_size_bytes", "test metric", nil),
+			"rdb_current_size_bytes": newMetricDescr("test", "rdb_current_size_bytes", "test metric", nil, nil),
 		},
 	}
 }

@@ -409,10 +409,10 @@ func waitForCapturedSNI(t *testing.T, sniCh <-chan string) string {
 	}
 }
 
-func TestValkeyTLSScheme(t *testing.T) {
+func TestRedisAndValkeyTLSSchemes(t *testing.T) {
 	for _, host := range []string{
 		os.Getenv("TEST_REDIS7_TLS_URI"),
-		os.Getenv("TEST_VALKEY8_TLS_URI"),
+		os.Getenv("TEST_VALKEY9_TLS_URI"),
 	} {
 		t.Run(host, func(t *testing.T) {
 			if host == "" {
@@ -500,6 +500,41 @@ func TestCreateServerTLSConfig(t *testing.T) {
 	}
 }
 
+func TestCreateServerTLSConfigMinVersionWithClientCA(t *testing.T) {
+	e, err := NewRedisExporter("", Options{Namespace: "test"})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() err: %s", err)
+	}
+
+	for _, tst := range []struct {
+		minVersionString string
+		want             uint16
+	}{
+		{"TLS1.2", tls.VersionTLS12},
+		{"TLS1.3", tls.VersionTLS13},
+	} {
+		t.Run(tst.minVersionString, func(t *testing.T) {
+			cfg, err := e.CreateServerTLSConfig("../contrib/tls/redis.crt", "../contrib/tls/redis.key", "../contrib/tls/ca.crt", tst.minVersionString)
+			if err != nil {
+				t.Fatalf("CreateServerTLSConfig() err: %s", err)
+			}
+			if cfg.GetConfigForClient == nil {
+				t.Fatalf("expected GetConfigForClient to be set when a client CA is configured")
+			}
+			clientConfig, err := cfg.GetConfigForClient(&tls.ClientHelloInfo{})
+			if err != nil {
+				t.Fatalf("GetConfigForClient() err: %s", err)
+			}
+			if clientConfig.MinVersion != tst.want {
+				t.Errorf("GetConfigForClient() MinVersion = %#x, want %#x", clientConfig.MinVersion, tst.want)
+			}
+			if clientConfig.ClientAuth != tls.RequireAndVerifyClientCert {
+				t.Errorf("GetConfigForClient() ClientAuth = %v, want RequireAndVerifyClientCert", clientConfig.ClientAuth)
+			}
+		})
+	}
+}
+
 func TestGetServerCertificateFunc(t *testing.T) {
 	// positive test
 	_, err := GetServerCertificateFunc("../contrib/tls/ca.crt", "../contrib/tls/ca.key")(nil)
@@ -525,5 +560,24 @@ func TestGetConfigForClientFunc(t *testing.T) {
 	_, err = GetConfigForClientFunc("/nonexisting/file", "/nonexisting/file", "/nonexisting/file")(nil)
 	if err == nil {
 		t.Errorf("Expected GetConfigForClientFunc() to fail")
+	}
+}
+
+func TestLoadCAFileWithoutCertificates(t *testing.T) {
+	caFile := filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(caFile, []byte("not a certificate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadCAFile(caFile); err == nil || !strings.Contains(err.Error(), "no PEM certificates found") {
+		t.Fatalf("LoadCAFile() err = %v, want a no PEM certificates error", err)
+	}
+
+	e, err := NewRedisExporter("", Options{CaCertFile: caFile})
+	if err != nil {
+		t.Fatalf("NewRedisExporter() err: %s", err)
+	}
+	if _, err := e.CreateClientTLSConfig(); err == nil {
+		t.Fatalf("CreateClientTLSConfig() succeeded with a CA file that has no certificates")
 	}
 }

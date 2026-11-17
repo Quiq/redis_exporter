@@ -105,7 +105,7 @@ func (e *Exporter) extractCheckKeyMetrics(ch chan<- prometheus.Metric, c redis.C
 
 	log.Debugf("e.keys: %#v", keys)
 
-	if scannedKeys, err := getKeysFromPatterns(c, keys, e.options.CheckKeysBatchSize); err == nil {
+	if scannedKeys, err := getKeysFromPatterns(c, keys, e.options.CheckKeysBatchSize, ""); err == nil {
 		allKeys = append(allKeys, scannedKeys...)
 	} else {
 		log.Errorf("Error expanding key patterns: %#v", err)
@@ -196,6 +196,8 @@ func (e *Exporter) extractCheckKeyMetricsPipelined(ch chan<- prometheus.Metric, 
 			keyTypes[idx], err = redis.String(c.Receive())
 			if err != nil {
 				log.Errorf("key: [%s] - Receive err: %s", keyName, err)
+				// still read the MEMORY USAGE reply so the next key gets its own replies
+				_, _ = c.Receive()
 				continue
 			}
 			memUsageInBytes, err := redis.Int64(c.Receive())
@@ -362,10 +364,12 @@ func (e *Exporter) getKeyInfoPipelined(ch chan<- prometheus.Metric, c redis.Conn
 }
 
 func (e *Exporter) extractCheckKeyMetricsNotPipelined(ch chan<- prometheus.Metric, c redis.Conn, allKeys []dbKeyPair) {
-	// Cluster mode only has one db
-	// no need to run `SELECT" but got to set it to "0" in the loop because it's used as the label
 	for _, k := range allKeys {
-		k.db = "0"
+		db, err := selectRedisDatabase(c, k.db)
+		if err != nil {
+			log.Errorf("Couldn't select database '%s' when getting key info: %s", k.db, err)
+			continue
+		}
 
 		keyType, err := redis.String(doRedisCmd(c, "TYPE", k.key))
 		if err != nil {
@@ -374,12 +378,12 @@ func (e *Exporter) extractCheckKeyMetricsNotPipelined(ch chan<- prometheus.Metri
 		}
 
 		if memUsageInBytes, err := redis.Int64(doRedisCmd(c, "MEMORY", "USAGE", k.key)); err == nil {
-			e.registerConstMetricGauge(ch, "key_memory_usage_bytes", float64(memUsageInBytes), "db"+k.db, k.key)
+			e.registerConstMetricGauge(ch, "key_memory_usage_bytes", float64(memUsageInBytes), "db"+db, k.key)
 		} else {
 			log.Errorf("MEMORY USAGE %s err: %s", k.key, err)
 		}
 
-		dbLabel := "db" + k.db
+		dbLabel := "db" + db
 		e.getKeyInfo(ch, c, dbLabel, keyType, k.key)
 	}
 }
@@ -409,7 +413,7 @@ func (e *Exporter) extractCountKeysMetrics(ch chan<- prometheus.Metric, c redis.
 func getKeysCount(c redis.Conn, pattern string, count int64) (int, error) {
 	keysCount := 0
 
-	keys, err := scanKeys(c, pattern, count)
+	keys, err := scanKeys(c, pattern, count, "")
 	if err != nil {
 		return keysCount, fmt.Errorf("error retrieving '%s' keys err: %s", pattern, err)
 	}
@@ -424,15 +428,20 @@ func getKeysCount(c redis.Conn, pattern string, count int64) (int, error) {
 // https://redis.io/commands/scan#the-match-option
 var globPattern = regexp.MustCompile(`[\?\*\[\]\^]+`)
 
-// getKeysFromPatterns does a SCAN for a key if the key contains pattern characters
-func getKeysFromPatterns(c redis.Conn, keys []dbKeyPair, count int64) (expandedKeys []dbKeyPair, err error) {
+// getKeysFromPatterns does a SCAN for a key if the key contains pattern characters.
+// keyType, when not empty, limits the SCAN to keys of that type.
+func getKeysFromPatterns(c redis.Conn, keys []dbKeyPair, count int64, keyType string) (expandedKeys []dbKeyPair, err error) {
+	if cluster, ok := c.(*clusterKeyConn); ok {
+		// SCAN cursors belong to the scraped node, not a redirect destination.
+		c = cluster.local
+	}
 	expandedKeys = []dbKeyPair{}
 	for _, k := range keys {
 		if globPattern.MatchString(k.key) {
 			if _, err := doRedisCmd(c, "SELECT", k.db); err != nil {
 				return expandedKeys, err
 			}
-			keyNames, err := redis.Strings(scanKeys(c, k.key, count))
+			keyNames, err := redis.Strings(scanKeys(c, k.key, count, keyType))
 			if err != nil {
 				log.Errorf("error with SCAN for pattern: %#v err: %s", k.key, err)
 				continue
@@ -493,17 +502,27 @@ func parseKeyArg(keysArgString string) (keys []dbKeyPair, err error) {
 	return keys, err
 }
 
-// scanForKeys returns a list of keys matching `pattern` by using `SCAN`, which is safer for production systems than using `KEYS`.
+// scanKeys returns a list of keys matching `pattern` by using `SCAN`, which is safer for production systems than using `KEYS`.
 // This function was adapted from: https://github.com/reisinger/examples-redigo
-func scanKeys(c redis.Conn, pattern string, count int64) (keys []any, err error) {
+// keyType, when not empty, is passed as the TYPE option of SCAN (Redis 6.0+) so that only keys of that type
+// are returned. Servers that don't support the option fall back to scanning keys of all types.
+func scanKeys(c redis.Conn, pattern string, count int64, keyType string) (keys []any, err error) {
 	if pattern == "" {
 		return keys, fmt.Errorf("pattern shouldn't be empty")
 	}
 
 	iter := 0
 	for {
-		arr, err := redis.Values(doRedisCmd(c, "SCAN", iter, "MATCH", pattern, "COUNT", count))
+		args := []any{iter, "MATCH", pattern, "COUNT", count}
+		if keyType != "" {
+			args = append(args, "TYPE", keyType)
+		}
+		arr, err := redis.Values(doRedisCmd(c, "SCAN", args...))
 		if err != nil {
+			if keyType != "" && strings.Contains(err.Error(), "syntax error") {
+				log.Debugf("SCAN doesn't support the TYPE option, scanning all key types for pattern: %s", pattern)
+				return scanKeys(c, pattern, count, "")
+			}
 			return keys, fmt.Errorf("error retrieving '%s' keys err: %s", pattern, err)
 		}
 		if len(arr) != 2 {

@@ -24,6 +24,7 @@ type ClientInfo struct {
 	Resp string
 	CreatedAt,
 	IdleSince,
+	IdleSeconds,
 	Sub,
 	Psub,
 	Ssub,
@@ -34,6 +35,12 @@ type ClientInfo struct {
 	Oll,
 	OMem,
 	TotMem int64
+	ReadEvents,
+	PipelineLengthSum,
+	PipelineLengthCount uint64
+	readEventsAvailable,
+	pipelineLengthSumAvailable,
+	pipelineLengthCountAvailable bool
 }
 
 /*
@@ -50,7 +57,7 @@ func parseClientListString(clientInfo string) (*ClientInfo, bool) {
 	connectedClient.Ssub = -1  // mark it as missing - introduced in Redis 7.0.3
 	connectedClient.Watch = -1 // mark it as missing - introduced in Redis 7.4
 	for kvPart := range strings.SplitSeq(clientInfo, " ") {
-		vPart := strings.Split(kvPart, "=")
+		vPart := strings.SplitN(kvPart, "=", 2)
 		if len(vPart) != 2 {
 			log.Debugf("Invalid format for client list string, got: %s", kvPart)
 			return nil, false
@@ -71,12 +78,13 @@ func parseClientListString(clientInfo string) (*ClientInfo, bool) {
 			}
 			connectedClient.CreatedAt = createdAt
 		case "idle":
-			idleSinceTs, err := durationFieldToTimestamp(vPart[1])
+			idleSeconds, err := strconv.ParseInt(vPart[1], 10, 64)
 			if err != nil {
 				log.Debugf("could not parse 'idle' field(%s): %s", vPart[1], err.Error())
 				return nil, false
 			}
-			connectedClient.IdleSince = idleSinceTs
+			connectedClient.IdleSeconds = idleSeconds
+			connectedClient.IdleSince = time.Now().Unix() - idleSeconds
 		case "flags":
 			connectedClient.Flags = vPart[1]
 		case "db":
@@ -101,6 +109,21 @@ func parseClientListString(clientInfo string) (*ClientInfo, bool) {
 			connectedClient.OMem, _ = strconv.ParseInt(vPart[1], 10, 64)
 		case "tot-mem":
 			connectedClient.TotMem, _ = strconv.ParseInt(vPart[1], 10, 64)
+		case "read-events":
+			if value, err := strconv.ParseUint(vPart[1], 10, 64); err == nil {
+				connectedClient.ReadEvents = value
+				connectedClient.readEventsAvailable = true
+			}
+		case "avg-pipeline-len-sum":
+			if value, err := strconv.ParseUint(vPart[1], 10, 64); err == nil {
+				connectedClient.PipelineLengthSum = value
+				connectedClient.pipelineLengthSumAvailable = true
+			}
+		case "avg-pipeline-len-cnt":
+			if value, err := strconv.ParseUint(vPart[1], 10, 64); err == nil {
+				connectedClient.PipelineLengthCount = value
+				connectedClient.pipelineLengthCountAvailable = true
+			}
 		case "addr":
 			hostPortString := strings.Split(vPart[1], ":")
 			if len(hostPortString) < 2 {
@@ -135,11 +158,18 @@ func (e *Exporter) extractConnectedClientMetrics(ch chan<- prometheus.Metric, c 
 }
 
 func (e *Exporter) parseConnectedClientMetrics(input string, ch chan<- prometheus.Metric) {
+	var idleClients int64
 
 	for s := range strings.SplitSeq(input, "\n") {
 		info, ok := parseClientListString(s)
 		if !ok {
 			log.Debugf("parseClientListString( %s ) - couldn';t parse input", s)
+			continue
+		}
+		if e.options.ExportClientIdleThreshold > 0 && info.IdleSeconds > e.options.ExportClientIdleThreshold && !strings.ContainsAny(info.Flags, "bPMSO") {
+			idleClients++
+		}
+		if !e.options.ExportClientList {
 			continue
 		}
 		clientInfoLabels := []string{"id", "name", "flags", "db", "host"}
@@ -181,6 +211,9 @@ func (e *Exporter) parseConnectedClientMetrics(input string, ch chan<- prometheu
 			"connected_client_query_buffer_free_space_bytes",
 			"connected_client_output_buffer_length_bytes",
 			"connected_client_output_list_length",
+			"connected_client_read_events_total",
+			"connected_client_pipeline_commands_total",
+			"connected_client_pipeline_batches_total",
 		} {
 			e.createMetricDescription(metricName, clientBaseLabels)
 		}
@@ -235,6 +268,25 @@ func (e *Exporter) parseConnectedClientMetrics(input string, ch chan<- prometheu
 			clientBaseLabelsValues...,
 		)
 
+		if info.readEventsAvailable {
+			e.registerConstMetric(
+				ch, "connected_client_read_events_total", float64(info.ReadEvents), prometheus.CounterValue,
+				clientBaseLabelsValues...,
+			)
+		}
+		if info.pipelineLengthSumAvailable {
+			e.registerConstMetric(
+				ch, "connected_client_pipeline_commands_total", float64(info.PipelineLengthSum), prometheus.CounterValue,
+				clientBaseLabelsValues...,
+			)
+		}
+		if info.pipelineLengthCountAvailable {
+			e.registerConstMetric(
+				ch, "connected_client_pipeline_batches_total", float64(info.PipelineLengthCount), prometheus.CounterValue,
+				clientBaseLabelsValues...,
+			)
+		}
+
 		if info.Ssub != -1 {
 			e.createMetricDescription("connected_client_shard_channel_subscriptions_count", clientBaseLabels)
 			e.registerConstMetricGauge(
@@ -249,5 +301,8 @@ func (e *Exporter) parseConnectedClientMetrics(input string, ch chan<- prometheu
 				clientBaseLabelsValues...,
 			)
 		}
+	}
+	if e.options.ExportClientIdleThreshold > 0 {
+		e.registerConstMetricGauge(ch, "idle_clients", float64(idleClients))
 	}
 }

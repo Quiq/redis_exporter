@@ -72,22 +72,23 @@ func (e *Exporter) connectToRedis() (redis.Conn, error) {
 		return nil, err
 	}
 
-	log.Debugf("Trying DialURL(): %s", uri)
-	c, err := redis.DialURL(uri, options...)
-	if err != nil {
-		log.Debugf("DialURL() failed, err: %s", err)
-		if frags := strings.Split(e.redisAddr, "://"); len(frags) == 2 {
-			log.Debugf("Trying: Dial(): %s %s", frags[0], frags[1])
-			c, err = redis.Dial(frags[0], frags[1], options...)
-		} else {
-			log.Debugf("Trying: Dial(): tcp %s", e.redisAddr)
-			c, err = redis.Dial("tcp", e.redisAddr, options...)
-		}
+	frags := strings.SplitN(uri, "://", 2)
+	switch strings.ToLower(frags[0]) {
+	case "redis", "rediss", "valkey", "valkeys":
+		// Preserve URL credentials, database selection and the original error.
+		log.Debugf("Trying DialURL(): %s", uri)
+		return redis.DialURL(uri, options...)
+	default:
+		log.Debugf("Trying Dial(): %s %s", frags[0], frags[1])
+		return redis.Dial(frags[0], frags[1], options...)
 	}
-	return c, err
 }
 
 func (e *Exporter) connectToRedisCluster() (redis.Conn, error) {
+	return e.connectToRedisClusterDatabase(0)
+}
+
+func (e *Exporter) connectToRedisClusterDatabase(db int) (redis.Conn, error) {
 	uri := e.redisAddr
 	if !strings.Contains(uri, "://") {
 		uri = "redis://" + uri
@@ -96,6 +97,10 @@ func (e *Exporter) connectToRedisCluster() (redis.Conn, error) {
 	options, err := e.configureOptions(uri)
 	if err != nil {
 		return nil, err
+	}
+	if db > 0 {
+		// Applied to every connection, including replacements after MOVED/ASK.
+		options = append(options, redis.DialDatabase(db))
 	}
 
 	// remove url scheme for redis.Cluster.StartupNodes

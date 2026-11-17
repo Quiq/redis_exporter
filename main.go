@@ -163,7 +163,7 @@ func main() {
 		checkKeys                      = flag.String("check-keys", getEnv("REDIS_EXPORTER_CHECK_KEYS", ""), "Comma separated list of key-patterns to export value and length/size, searched for with SCAN")
 		checkSingleKeys                = flag.String("check-single-keys", getEnv("REDIS_EXPORTER_CHECK_SINGLE_KEYS", ""), "Comma separated list of single keys to export value and length/size")
 		checkKeyGroups                 = flag.String("check-key-groups", getEnv("REDIS_EXPORTER_CHECK_KEY_GROUPS", ""), "Comma separated list of lua regex for grouping keys")
-		checkStreams                   = flag.String("check-streams", getEnv("REDIS_EXPORTER_CHECK_STREAMS", ""), "Comma separated list of stream-patterns to export info about streams, groups and consumers, searched for with SCAN")
+		checkStreams                   = flag.String("check-streams", getEnv("REDIS_EXPORTER_CHECK_STREAMS", ""), "Comma separated list of stream-patterns to export info about streams, groups and consumers, searched for with SCAN (only keys of type stream)")
 		checkSingleStreams             = flag.String("check-single-streams", getEnv("REDIS_EXPORTER_CHECK_SINGLE_STREAMS", ""), "Comma separated list of single streams to export info about streams, groups and consumers")
 		streamsExcludeConsumerMetrics  = flag.Bool("streams-exclude-consumer-metrics", getEnvBool("REDIS_EXPORTER_STREAMS_EXCLUDE_CONSUMER_METRICS", false), "Don't collect per consumer metrics for streams (decreases cardinality)")
 		countKeys                      = flag.String("count-keys", getEnv("REDIS_EXPORTER_COUNT_KEYS", ""), "Comma separated list of patterns to count (eg: 'db0=production_*,db3=sessions:*'), searched for with SCAN")
@@ -191,6 +191,7 @@ func main() {
 		isCluster                      = flag.Bool("is-cluster", getEnvBool("REDIS_EXPORTER_IS_CLUSTER", false), "Whether this is a redis cluster (Enable this if you need to fetch key level data on a Redis Cluster).")
 		clusterDiscoverHostnames       = flag.Bool("cluster-discover-hostnames", getEnvBool("REDIS_EXPORTER_CLUSTER_DISCOVER_HOSTNAMES", false), "Whether to use hostname for cluster node discovery if available via `/discover-cluster-nodes` endpoint.")
 		exportClientList               = flag.Bool("export-client-list", getEnvBool("REDIS_EXPORTER_EXPORT_CLIENT_LIST", false), "Whether to scrape Client List specific metrics")
+		exportClientIdleThreshold      = flag.Int64("export-client-idle-threshold", getEnvInt64("REDIS_EXPORTER_EXPORT_CLIENT_IDLE_THRESHOLD", 0), "Export the number of clients idle longer than this many seconds, excluding blocked, pub/sub, replication, and MONITOR clients. 0 disables the metric")
 		exportClientPort               = flag.Bool("export-client-port", getEnvBool("REDIS_EXPORTER_EXPORT_CLIENT_PORT", false), "Whether to include the client's port when exporting the client list. Warning: including the port increases the number of metrics generated and will make your Prometheus server take up more memory")
 		showVersion                    = flag.Bool("version", false, "Show version information and exit")
 		redisMetricsOnly               = flag.Bool("redis-only-metrics", getEnvBool("REDIS_EXPORTER_REDIS_ONLY_METRICS", false), "Whether to export only Redis metrics (omit Go process+runtime metrics)")
@@ -198,11 +199,15 @@ func main() {
 		pingOnConnect                  = flag.Bool("ping-on-connect", getEnvBool("REDIS_EXPORTER_PING_ON_CONNECT", false), "Whether to ping the redis instance after connecting")
 		inclConfigMetrics              = flag.Bool("include-config-metrics", getEnvBool("REDIS_EXPORTER_INCL_CONFIG_METRICS", false), "Whether to include all config settings as metrics")
 		inclModulesMetrics             = flag.Bool("include-modules-metrics", getEnvBool("REDIS_EXPORTER_INCL_MODULES_METRICS", false), "Whether to collect Redis Modules metrics")
+		inclClusterSlotStats           = flag.Bool("include-cluster-slot-stats", getEnvBool("REDIS_EXPORTER_INCL_CLUSTER_SLOT_STATS", false), "Whether to collect per-slot metrics from CLUSTER SLOT-STATS (Valkey 8.0+, up to 16384 slots x 4 series)")
+		inclKeysizesMetrics            = flag.Bool("include-keysizes-metrics", getEnvBool("REDIS_EXPORTER_INCL_KEYSIZES_METRICS", false), "Whether to collect key size distribution metrics from the KEYSIZES section of INFO (Redis 8.0+); one series per non-empty power-of-two bucket per data type, measure and db (theoretically up to 64 buckets)")
 		inclSearchIndexesMetrics       = flag.Bool("include-search-indexes-metrics", getEnvBool("REDIS_EXPORTER_INCL_SEARCH_INDEXES_METRICS", false), "Whether to collect Redis Search indexes metrics")
 		inclSentinelPeerInfo           = flag.Bool("include-sentinel-peer-info", getEnvBool("REDIS_EXPORTER_INCL_SENTINEL_PEER_INFO", false), "Whether to export sentinel_peer_info metrics (high cardinality)")
 		checkSearchIndexes             = flag.String("check-search-indexes", getEnv("REDIS_EXPORTER_CHECK_SEARCH_INDEXES", ".*"), "Regex pattern for Redis Search indexes to export metrics from FT.INFO command")
 		disableExportingKeyValues      = flag.Bool("disable-exporting-key-values", getEnvBool("REDIS_EXPORTER_DISABLE_EXPORTING_KEY_VALUES", false), "Whether to disable values of keys stored in redis as labels or not when using check-keys/check-single-key")
 		excludeLatencyHistogramMetrics = flag.Bool("exclude-latency-histogram-metrics", getEnvBool("REDIS_EXPORTER_EXCLUDE_LATENCY_HISTOGRAM_METRICS", false), "Do not try to collect latency histogram metrics")
+		excludeSlowlogMetrics          = flag.Bool("exclude-slowlog-metrics", getEnvBool("REDIS_EXPORTER_EXCLUDE_SLOWLOG_METRICS", false), "Do not try to collect slowlog metrics (skips the SLOWLOG commands)")
+		excludeCommandlogMetrics       = flag.Bool("exclude-commandlog-metrics", getEnvBool("REDIS_EXPORTER_EXCLUDE_COMMANDLOG_METRICS", false), "Do not try to collect commandlog metrics (skips the COMMANDLOG commands and the support probe)")
 		redactConfigMetrics            = flag.Bool("redact-config-metrics", getEnvBool("REDIS_EXPORTER_REDACT_CONFIG_METRICS", true), "Whether to redact config settings that include potentially sensitive information like passwords")
 		inclSystemMetrics              = flag.Bool("include-system-metrics", getEnvBool("REDIS_EXPORTER_INCL_SYSTEM_METRICS", false), "Whether to include system metrics like e.g. redis_total_system_memory_bytes")
 		inclRdbFileSizeMetric          = flag.Bool("include-rdb-file-size-metric", getEnvBool("REDIS_EXPORTER_INCL_RDB_FILE_SIZE_METRIC", false), "Whether to include RDB file size metric. Note: Requires the exporter to run on the same host as Redis with read access to the RDB directory. Will not work in remote or containerized deployments where the RDB file is not accessible.")
@@ -282,6 +287,8 @@ func main() {
 			InclConfigMetrics:              *inclConfigMetrics,
 			DisableExportingKeyValues:      *disableExportingKeyValues,
 			ExcludeLatencyHistogramMetrics: *excludeLatencyHistogramMetrics,
+			ExcludeSlowlogMetrics:          *excludeSlowlogMetrics,
+			ExcludeCommandlogMetrics:       *excludeCommandlogMetrics,
 			RedactConfigMetrics:            *redactConfigMetrics,
 			SetClientName:                  *setClientName,
 			IsTile38:                       *isTile38,
@@ -289,9 +296,12 @@ func main() {
 			ClusterDiscoverHostnames:       *clusterDiscoverHostnames,
 			InclModulesMetrics:             *inclModulesMetrics,
 			InclSearchIndexesMetrics:       *inclSearchIndexesMetrics,
+			InclClusterSlotStats:           *inclClusterSlotStats,
+			InclKeysizesMetrics:            *inclKeysizesMetrics,
 			InclSentinelPeerInfo:           *inclSentinelPeerInfo,
 			CheckSearchIndexes:             *checkSearchIndexes,
 			ExportClientList:               *exportClientList,
+			ExportClientIdleThreshold:      *exportClientIdleThreshold,
 			ExportClientsInclPort:          *exportClientPort,
 			SkipCheckKeysForRoleMaster:     *skipCheckKeysForRoleMaster,
 			SkipTLSVerification:            *skipTLSVerification,

@@ -75,7 +75,15 @@ func (e *Exporter) CreateServerTLSConfig(certFile, keyFile, caCertFile, minVersi
 		if err != nil {
 			return nil, err
 		}
-		tlsConfig.GetConfigForClient = GetConfigForClientFunc(certFile, keyFile, caCertFile)
+		getConfigForClient := GetConfigForClientFunc(certFile, keyFile, caCertFile)
+		tlsConfig.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			clientConfig, err := getConfigForClient(hello)
+			if err != nil {
+				return nil, err
+			}
+			clientConfig.MinVersion = minVersion
+			return clientConfig, nil
+		}
 	}
 
 	return &tlsConfig, nil
@@ -125,6 +133,8 @@ func LoadCAFile(caFile string) (*x509.CertPool, error) {
 		return nil, err
 	}
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(pemCerts)
+	if !pool.AppendCertsFromPEM(pemCerts) {
+		return nil, fmt.Errorf("no PEM certificates found in CA cert file %q", caFile)
+	}
 	return pool, nil
 }
